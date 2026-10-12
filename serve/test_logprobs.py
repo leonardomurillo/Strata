@@ -14,8 +14,8 @@ from types import SimpleNamespace
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 from serve.frontend import ChatTemplate  # noqa: E402
-from serve.server import (ByteTokenizer, MockEngine, Service, StrataEngine, logprob_span, serve,  # noqa: E402
-                          top_logprobs)
+from serve.server import (ByteTokenizer, LogprobEntries, LPLines, MockEngine, Service, StrataEngine,  # noqa: E402
+                          logprob_span, serve, top_logprobs)
 
 
 class Tokenizer(ByteTokenizer):
@@ -37,7 +37,7 @@ class LpEngine(MockEngine):
         self.with_lines, self.sampling = lines, None
 
     def generate(self, ids, max_new, sampling, cancel, embeddings=None):
-        self.sampling, self.lp_lines = dict(sampling or {}), __import__("collections").deque()
+        self.sampling, self.lp_lines = dict(sampling or {}), LPLines(cancel)
         for i, t in enumerate(super().generate(ids, max_new, sampling, cancel, embeddings)):
             if self.with_lines:
                 self.lp_lines.append((t, f"LP {-(i + 1) / 100:.6f} 65:-0.500000\n"))
@@ -57,6 +57,29 @@ class Keys(unittest.TestCase):
         self.assertEqual(top_logprobs({"logprobs": 2}), 2)               # the legacy completions form
         for req in ({}, {"logprobs": False}, {"logprobs": None}, {"top_logprobs": 3}):
             self.assertIsNone(top_logprobs(req))
+
+    def test_a_request_reads_only_its_own_lines(self):
+        # the tail of request A (read after it left the queue) must not take the lines of request B that started
+        tok, a, b = Tokenizer(), threading.Event(), threading.Event()
+        eng = SimpleNamespace(lp_lines=LPLines(a))
+        eng.lp_lines.append((72, "LP -0.100000"))
+        lp = LogprobEntries(SimpleNamespace(tok=tok, stop_ids=set()), a)
+        self.assertEqual([e["token"] for e in lp.take(eng)], ["H"])
+        eng.lp_lines.append((105, "LP -0.200000"))       # A's last token, read after B started
+        eng.lp_lines = LPLines(b)
+        eng.lp_lines.append((66, "LP -0.300000 67:-1.0"))
+        self.assertEqual([e["token"] for e in lp.take(eng)], ["i"])
+        self.assertEqual(list(eng.lp_lines), [(66, "LP -0.300000 67:-1.0")])   # B's line left for B
+        mine = LogprobEntries(SimpleNamespace(tok=tok, stop_ids=set()), b)
+        self.assertEqual([e["token"] for e in mine.take(eng)], ["B"])
+
+    def test_unreadable_lines_give_no_entry(self):
+        tok, a = Tokenizer(), threading.Event()
+        eng = SimpleNamespace(lp_lines=LPLines(a))
+        for line in ("LP nan", "LP -nan(ind)", "LP inf", "LP -0.1 65:x", "LP -0.200000 65:-1.0"):
+            eng.lp_lines.append((72, line))
+        got = LogprobEntries(SimpleNamespace(tok=tok, stop_ids=set()), a).take(eng)
+        self.assertEqual([e["logprob"] for e in got], [-0.2])
 
     def test_the_engine_key_only_when_asked(self):
         self.assertIn(" logprobs=0", StrataEngine.sampling_keys({"logprobs": True}))
@@ -146,6 +169,13 @@ class Api(unittest.TestCase):
         self.assertEqual(lps[0]["logprob"], -0.01)
         self.assertEqual(lps[0]["top_logprobs"], [{"token": "A", "logprob": -0.5, "bytes": [65]}])
         self.assertEqual(self.engine.sampling.get("logprobs"), True)
+
+    def test_logprobs_need_a_bounded_reply(self):
+        for max_tokens in (0, 5000):                       # 0: "the rest of the context"
+            with self.assertRaises(urllib.error.HTTPError) as cm:
+                self.post({"logprobs": True, "max_tokens": max_tokens})
+            self.assertEqual(cm.exception.code, 400)
+        self.assertIn("logprobs", self.post({"logprobs": True, "max_tokens": 4096})["choices"][0])
 
     def test_streamed(self):
         chunks = self.post({"logprobs": True}, stream=True)

@@ -1337,7 +1337,7 @@ class StrataEngine:
         born = self.gen                                 # the engine process this request is sent to
         keys = self.sampling_keys(sampling or {})
         want_lp = top_logprobs(sampling or {}) is not None
-        self.lp_lines = collections.deque()             # this request's (per thread with batch slots)
+        self.lp_lines = LPLines(cancel)                 # this request's (per thread with batch slots)
         out: list[int] = []
         pending: list[int] = []
         prompt, left = list(ids), int(max_new)
@@ -1688,7 +1688,7 @@ class StrataEngine:
         # logprobs: the engine writes "LP <logprob> [id:logprob ...]" right after each "T <id>" (the same flush), read
         # here before the token is yielded, so whoever takes the token finds its line in lp_lines
         want_lp = top_logprobs(sampling or {}) is not None
-        self.lp_lines = collections.deque()
+        self.lp_lines = LPLines(cancel)
         carry = NO_LINE
         # an image request takes the same sampling keys as text (#75: it used to decode greedily whatever was asked)
         head = f"GENI {int(max_new)}{self.sampling_keys(sampling or {})} {embeddings}" if embeddings else \
@@ -4404,6 +4404,23 @@ def top_logprobs(req: dict):
     return None
 
 
+# A reply with logprobs keeps every entry (its token, bytes and up to 20 alternatives) until it ends when it is not
+# streamed or answers a json_schema, and spell() matches text against the entries still pending: a bounded reply
+# keeps that memory and work bounded.  A typed decision is one token.
+LOGPROBS_MAX_TOKENS = 4096
+
+
+class LPLines(collections.deque):
+    """One request's LP lines, tagged with its cancel Event (one per request, handed unchanged from the handler
+    through Service.run to Engine.generate).  The last events of a request - the parser's and the stop strings'
+    tail - come after it has left the queue, when the next request may already have replaced the engine's lp_lines
+    with its own: LogprobEntries reads only the lines tagged with its own request's Event."""
+
+    def __init__(self, owner=None):
+        super().__init__()
+        self.owner = owner
+
+
 class LogprobEntries:
     """The engine's LP lines as OpenAI's logprobs.content entries.  Each token's "token" is the text it completes
     (an incremental UTF-8 decode, as the reply's text is made), so a character split across tokens is in the token
@@ -4411,10 +4428,12 @@ class LogprobEntries:
     ends the reply and is not listed (OpenAI does not list it either).  Tokens that make no text of the reply (the
     `</think>` tag and the newlines after it) are left out: spell() gives each piece of text the tokens that spell it."""
 
-    def __init__(self, svc):
+    def __init__(self, svc, owner=None):
         self.tok, self.stop_ids = svc.tok, svc.stop_ids
         self.inc = codecs.getincrementaldecoder("utf-8")(errors="replace")
         self.pending = []                          # entries read but not yet given to a piece of text
+        self.owner = owner                         # the request's cancel Event (LPLines)
+        self.lines = None                          # this request's current LPLines, kept once seen
 
     def spell(self, eng, text: str) -> list:
         """The entries whose tokens spell `text`, the next piece of the reply: the tokens before it made no text
@@ -4444,20 +4463,32 @@ class LogprobEntries:
         return self.tok.decode([t]).encode("utf-8")
 
     def take(self, eng) -> list:
-        lines, out = getattr(eng, "lp_lines", None), []
-        while lines:
-            t, line = lines.popleft()
-            f = line.split()
-            if t in self.stop_ids or len(f) < 2 or f[1] == "nan":
-                continue
-            b = self.raw(t)
-            e = {"token": self.inc.decode(b), "logprob": float(f[1]), "bytes": list(b), "top_logprobs": []}
-            for x in f[2:]:
-                i, _, v = x.partition(":")
-                alt = self.raw(int(i))
-                e["top_logprobs"].append({"token": alt.decode("utf-8", "replace"), "logprob": float(v),
-                                          "bytes": list(alt)})
-            out.append(e)
+        # the engine's current lines are this request's only when they carry its Event (a later generate pass
+        # of the same request makes new ones: the old ones are read to the end first); another request's never are
+        cur, old = getattr(eng, "lp_lines", None), None
+        if cur is not self.lines and getattr(cur, "owner", None) is self.owner:
+            old, self.lines = self.lines, cur
+        out = []
+        for lines in (old, self.lines):
+            while lines:
+                t, line = lines.popleft()
+                f = line.split()
+                if t in self.stop_ids or len(f) < 2:
+                    continue
+                try:                               # "nan" / "-nan(ind)" (MSVC) or a cut line: no entry for it
+                    lp = float(f[1])
+                    alts = [(int(i), float(v)) for i, _, v in (x.partition(":") for x in f[2:])]
+                except ValueError:
+                    continue
+                if not math.isfinite(lp):
+                    continue
+                b = self.raw(t)
+                e = {"token": self.inc.decode(b), "logprob": lp, "bytes": list(b), "top_logprobs": []}
+                for i, v in alts:
+                    alt = self.raw(i)
+                    e["top_logprobs"].append({"token": alt.decode("utf-8", "replace"), "logprob": v,
+                                              "bytes": list(alt)})
+                out.append(e)
         return out
 
 
@@ -4493,7 +4524,7 @@ def openai_chunks(svc: Service, req: dict, ids, thinking, tools, max_new, cancel
                 "choices": [{"index": 0, "delta": delta, "finish_reason": finish}]}
 
     yield chunk({"role": "assistant", "content": ""})
-    lp = LogprobEntries(svc) if top_logprobs(req) is not None else None
+    lp = LogprobEntries(svc, cancel) if top_logprobs(req) is not None else None
 
     def with_lp(c, key):
         got = lp.spell(svc.engine, c["choices"][0]["delta"][key]) if lp is not None else None
@@ -5537,6 +5568,8 @@ def make_handler(svc: Service):
             svc.load()
             max_req = max_new = int(req.get("max_completion_tokens") or req.get("max_tokens") or 0)   # 0/-1: the rest
             bias_api.validate_request(req, svc.engine, len(getattr(svc.tok, "tokens", ())) or None)
+            if top_logprobs(req) is not None and not 0 < max_req <= LOGPROBS_MAX_TOKENS:
+                raise ValueError(f"logprobs: max_tokens (or max_completion_tokens) 1..{LOGPROBS_MAX_TOKENS} is required")
             if top_logprobs(req) is not None and getattr(svc.engine, "batch", 0) and max_req != 1:
                 # a batch slot's BT lines carry no LP lines: past its first token a request would get partial or
                 # misplaced entries.  One token (a typed decision) is read on the control lines and has its LP line.

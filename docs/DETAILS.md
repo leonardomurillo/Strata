@@ -1253,6 +1253,9 @@ temperature and sampling, as the SYCL port does ([INTEL.md](INTEL.md)); the stop
 tokens, joined, spell the reply. With thinking on, the thinking's tokens are under `reasoning_content`. With
 `response_format` `json_schema`, the answer is returned as the model wrote it (validated as usual) when its tokens
 spell it, the JSON inside a ```` ```json ```` fence included; otherwise the canonical JSON without `logprobs`.
+A request with `logprobs` needs `max_tokens` (or `max_completion_tokens`) between 1 and 4096, a 400 otherwise: a
+reply's entries are kept until it ends, so the reply is bounded. Each request reads only its own `LP` lines, also
+for the last pieces of a reply that are sent after the next request has started.
 Measured on a Radeon 8060S (Windows, UD-IQ4_XS, `--spec 4 --mtp`, a greedy 255-token answer): the same text with
 and without `logprobs`, 38.2 and 38.4 tok/s.
 
