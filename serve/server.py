@@ -1673,6 +1673,47 @@ class StrataEngine:
                          "tok_s": round(r["generated"] / max(1e-6, now - ft), 1) if ft else None})
         return view
 
+    def score(self, ids, branches, cancel, pin=0, timeout_s=600.0):
+        """Decision branches (serve/decision.py): one GEN request whose `score=` key carries every branch's tokens
+        (they follow the prompt's last token) and its candidate ids.  The engine reads the prompt, scores every branch
+        from the same state and decodes nothing.  -> ([{candidate id: logprob} or None (a non-finite row) per branch],
+        the DONE line).  `pin`: the first N prompt tokens are a shared prefix kept for the next decision (needs the
+        request checkpointed; without it the request is one-shot, ckpt=0)."""
+        if not self.alive():
+            raise EngineDied("the engine is unavailable; this request was not sent")
+        if getattr(self, "batch", 0):
+            raise ValueError("decisions need an engine without parallel slots")
+        spec = ";".join(",".join(str(int(t)) for t in toks) + ":" + ",".join(str(int(c)) for c in cands)
+                        for toks, cands in branches)
+        keys = (f" pin={int(pin)}" if pin else " ckpt=0") + f" score={spec}"
+        try:
+            self.proc.stdin.write(f"GEN 1{keys} {','.join(str(int(t)) for t in ids)}\n")
+            self.proc.stdin.flush()
+        except OSError:                                  # the pipe is gone: the engine died (not the client)
+            raise EngineDied(f"the engine stopped unexpectedly (exit code {self.exit_code()})") from None
+        out: list = [None] * len(branches)
+        end = time.monotonic() + timeout_s
+        while True:
+            try:
+                line = self.lines.get(timeout=0.5)
+            except queue.Empty:
+                if time.monotonic() > end:
+                    raise self._silent(f"no answer to a decision within {timeout_s:.0f} s")
+                continue
+            if line is None:
+                raise EngineDied(f"the engine stopped unexpectedly (exit code {self.exit_code()})")
+            if line.startswith("DS "):
+                f = line.split()
+                k = int(f[1])
+                if 0 <= k < len(out) and f[2:] != ["nan"]:
+                    out[k] = {int(a): float(b) for a, _, b in (x.partition(":") for x in f[2:])}
+            elif line.startswith("DONE"):
+                return out, line.strip()
+            elif line.startswith("ERR score:"):          # refused before the prompt was read: the request's fault
+                raise ValueError(line[len("ERR score:"):].strip())
+            elif line.startswith("ERR"):
+                raise EngineDied(line[4:].strip() or "the engine failed during a decision")
+
     def generate(self, ids, max_new, sampling, cancel, embeddings=None):
         """Yields token ids, and None as a heartbeat every 10 s while the engine is quiet (reading a long prompt):
         the HTTP layer turns it into an SSE comment, which keeps clients' watchdogs calm and notices a client that
@@ -3526,6 +3567,57 @@ class Service:
                     content[n] = {"type": "text", "text": f"[image omitted: {why}]"}
         return fetched
 
+    def decide_spike(self, req: dict) -> dict:
+        """SPIKE ONLY (POST /strata/score): one decision's timing on the real engine.  {system, user, fields: [{suffix,
+        options}], pin_head, lead} -> per field its options' probabilities (softmax over each option's first token)
+        and the engine time.  serve/decision.py replaces this with the full schema compiler."""
+        tok = self.tok
+
+        def ids_of(msgs):
+            body = {"messages": msgs, "chat_template_kwargs": {"enable_thinking": False}}
+            messages, tools, kw = openai_to_messages(body)
+            return list(self.prepare(messages, None, kw, 1, req=body)[0])
+
+        system = {"role": "system", "content": str(req.get("system") or "")}
+        ids = ids_of([system, {"role": "user", "content": str(req.get("user") or "")}])
+        ids += tok.encode(str(req.get("lead", "{\n")))
+        pin = 0
+        if req.get("pin_head"):
+            head = ids_of([system, {"role": "user", "content": ""}])
+            pin = next((i for i, (a, b) in enumerate(zip(ids, head)) if a != b), min(len(ids), len(head)))
+            pin = pin if 0 < pin < len(ids) - 1 else 0
+        branches, names = [], []
+        for f in req.get("fields") or []:
+            cands = [tok.encode(str(o))[0] for o in f["options"]]
+            if len(set(cands)) != len(cands):
+                raise ValueError(f"options {f['options']}: their first tokens collide (the spike scores first tokens)")
+            branches.append((tok.encode(str(f["suffix"])), cands))
+            names.append([str(o) for o in f["options"]])
+        if not branches:
+            raise ValueError("fields: one or more")
+        if not self.fifo.acquire(timeout=600):
+            raise ModelBusy("a request is running or queued")
+        try:
+            self.ensure_loaded()
+            t0 = time.perf_counter()
+            res, done = self.engine.score(ids, branches, threading.Event(), pin=pin)
+            ms = (time.perf_counter() - t0) * 1000.0
+            self.last_request_at = time.time()
+        finally:
+            self.fifo.release()
+        fields = []
+        for opts, r, (_, cands) in zip(names, res, branches):
+            if r is None:
+                fields.append(None)
+                continue
+            lps = [r.get(c, float("-inf")) for c in cands]
+            top = max(lps)
+            ex = [math.exp(v - top) for v in lps]
+            z = sum(ex)
+            fields.append({o: round(e / z, 4) for o, e in zip(opts, ex)})
+        return {"fields": fields, "ms": round(ms, 1), "prompt_tokens": len(ids), "branches": len(branches),
+                "pin": pin, "done": done}
+
     def prepare(self, messages, tools, kwargs, max_new=None, force=None, req=None):
         """-> (ids, thinking, max_new). An unset or non-positive max_new (some clients send -1) means "unlimited":
         the rest of the context.  `force` (forced_call): without thinking the reply starts with it, so it ends the
@@ -5304,6 +5396,8 @@ def make_handler(svc: Service):
                     self._anthropic(req)
                 elif path == "/v1/messages/count_tokens":
                     self._count_tokens(req)
+                elif path == "/strata/score":                # SPIKE ONLY (decisions): see Service.decide_spike
+                    self._json(200, svc.decide_spike(req))
                 else:
                     self._json(404, {"error": {"message": "not found"}})
             except EngineNonFinite as e:                    # #879, twice: not the request's fault

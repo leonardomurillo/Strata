@@ -10058,6 +10058,8 @@ int main(int argc, char** argv) {
             // the missed experts and the draft-probability floor, for this request only
             double req_pcie_frac = o.pcie_frac, req_spec_min_p = o.spec_min_p;
             int req_aux_cpus = -1;   // aux_cpus=0|1: --aux-cpus for this request (-1 = the start-up value)
+            // score=<branch>;<branch>;... (decisions, serve/decision.py): see the score block after the prompt read
+            std::string req_score_text;
             if (endp != nullptr) {   // GENI takes the same keys (#75: image requests were always greedy); its
                                      // embedding file path is the first token without an =
                 for (;;) {
@@ -10087,6 +10089,7 @@ int main(int argc, char** argv) {
                     else if (key == "pcie_frac") req_pcie_frac = std::clamp((double) fv, 0.0, 1.0);
                     else if (key == "spec_min_p") req_spec_min_p = std::clamp((double) fv, 0.0, 1.0);
                     else if (key == "aux_cpus") req_aux_cpus = std::atoi(tok.c_str() + eq + 1) != 0 ? 1 : 0;
+                    else if (key == "score") req_score_text = tok.substr(eq + 1);
                     // unknown keys are skipped: the ids start at the first token without '='
                 }
             }
@@ -10110,6 +10113,50 @@ int main(int argc, char** argv) {
                 continue;
             }
             const int64_t n = (int64_t) ids.size();
+            // score=: each branch is "t,t,...:c,c,..." - its tokens after the prompt's last token, then the candidate
+            // ids scored at its last row.  Checked here, before anything is read, so a bad one costs no prompt.
+            struct ScoreBranch { std::vector<int32_t> toks, cands; };
+            std::vector<ScoreBranch> score_branches;
+            if (!req_score_text.empty()) {
+                std::string se;
+                auto ids_of = [&](const std::string& s, std::vector<int32_t>& out, size_t cap) {
+                    for (size_t i = 0; i < s.size();) {
+                        size_t j = s.find(',', i);
+                        if (j == std::string::npos) j = s.size();
+                        char* e = nullptr;
+                        const long long v = std::strtoll(s.c_str() + i, &e, 10);
+                        if (e != s.c_str() + j || v < 0 || v >= (long long) n_vocab || out.size() >= cap) return false;
+                        out.push_back((int32_t) v);
+                        i = j + 1;
+                    }
+                    return true;
+                };
+                for (size_t i = 0; se.empty();) {
+                    size_t j = req_score_text.find(';', i);
+                    if (j == std::string::npos) j = req_score_text.size();
+                    const std::string b = req_score_text.substr(i, j - i);
+                    const size_t c = b.find(':');
+                    ScoreBranch sb;
+                    if (c == std::string::npos || !ids_of(b.substr(0, c), sb.toks, 256) ||
+                        !ids_of(b.substr(c + 1), sb.cands, 256) || sb.cands.empty())
+                        se = "branch " + std::to_string(score_branches.size()) + " is not t,t,...:c,c,... (ids below " +
+                             std::to_string((long long) n_vocab) + ", at most 256 of each, one candidate or more)";
+                    else if (n + (int64_t) sb.toks.size() > o.max_context)
+                        se = "branch " + std::to_string(score_branches.size()) + " runs past the context";
+                    else if (score_branches.size() >= 4096)
+                        se = "more than 4096 branches";
+                    else
+                        score_branches.push_back(std::move(sb));
+                    if (j >= req_score_text.size()) break;
+                    i = j + 1;
+                }
+                if (se.empty() && (geni || n_stages > 1 || o.batch > 0))
+                    se = "decisions need a text request on a single-GPU engine without --batch";
+                if (!se.empty()) {
+                    std::printf("ERR score: %s\n", se.c_str());
+                    continue;
+                }
+            }
             req_imgs.clear();
             if (geni && !o.vision) { std::printf("ERR this engine was started without --vision\n"); continue; }
             if (geni || !mrope_identity) {
@@ -11188,6 +11235,84 @@ int main(int argc, char** argv) {
             const int64_t offload0 = drive.d.offload_entries;   // #588
             pcie_auto.mark(drive.d.ms_run, drive.d.multi_misses);   // the prompt's windows are not the decode's
             if (cancelled) finish = nf_hit ? "nonfinite" : "cancel";
+            // ======== score=: decision branches (serve/decision.py) instead of a decode ========
+            // The prompt is read up to its last token x.  Each branch's tokens follow x through the verify windows a
+            // decode uses (head sampling off, no drafts; a branch longer than a window commits window by window) and
+            // its candidates are read at its last row as log-probabilities over the whole vocabulary.  After every
+            // branch the state goes back to the trunk saved here, so every branch starts from the same state (the
+            // fields of a decision cannot see each other) and nothing of a branch stays in the session.  One line per
+            // branch: "DS <branch> <id>:<logprob> ..." ("DS <branch> nan" for a non-finite row); then DONE as usual.
+            bool scored = false;
+            if (!cancelled && !score_branches.empty()) {
+                scored = true;
+                finish = "score";
+                ConvCheckpoint trunk;
+                if (!ver.wait_commit(err) || !gpu_sync_ok() || !checkpoint_save(trunk, ss, g)) {
+                    std::printf("ERR score: saving the trunk failed%s%s\n", ckpt_why.c_str(), err.c_str());
+                    return 1;
+                }
+                struct NoHeadSampling {
+                    strata::core::Verifier& v;
+                    explicit NoHeadSampling(strata::core::Verifier& x) : v(x) { v.set_head_sampling(false); }
+                    ~NoHeadSampling() { v.set_head_sampling(true); }
+                } no_head(ver);
+                std::vector<float> row((size_t) ver.vocab());
+                std::vector<int32_t> seq, outw((size_t) std::max(S, 1));
+                for (size_t bi = 0; bi < score_branches.size(); ++bi) {
+                    if (stop_req.load()) { finish = "cancel"; break; }
+                    const ScoreBranch& B = score_branches[bi];
+                    seq.assign(1, x);
+                    seq.insert(seq.end(), B.toks.begin(), B.toks.end());
+                    const int64_t L = (int64_t) seq.size();
+                    if (kvg.on && p + L + 64 > kvg.cells &&
+                        !kvg_ensure(p + L + 64, [&] { cudaDeviceSynchronize(); apply_pending(true); })) {
+                        std::printf("ERR the K/V cannot grow: no VRAM is left\n");
+                        return 1;
+                    }
+                    bool row_ok = false;
+                    for (int64_t at = 0;;) {
+                        const int T = (int) std::min<int64_t>((int64_t) std::max(S, 1), L - at);
+                        drive.d.layers = 0;
+                        drive.d.experts = 0;
+                        drive.d.failed = false;
+                        if (!ver.run(T, seq.data() + at, p + at, win_pool_fn, win_pool_user, outw.data(), err) ||
+                            drive.d.failed) {
+                            std::printf("ERR %s\n", drive.d.failed && drive.d.fail ? drive.d.fail : err.c_str());
+                            return 1;
+                        }
+                        if (at + T >= L) {   // the branch's last row: its candidates
+                            row_ok = ver.copy_logits(T - 1, row.data());
+                            break;
+                        }
+                        if (!ver.commit(T, err)) {
+                            std::printf("ERR %s\n", err.c_str());
+                            return 1;
+                        }
+                        at += T;
+                    }
+                    double lse = NAN;
+                    if (row_ok) {
+                        float mx = -INFINITY;
+                        for (const float v : row) mx = std::max(mx, v);
+                        double sum = 0.0;
+                        for (const float v : row) sum += std::exp((double) v - mx);
+                        lse = (double) mx + std::log(sum);
+                    }
+                    if (!std::isfinite(lse)) {
+                        std::printf("DS %zu nan\n", bi);
+                    } else {
+                        std::printf("DS %zu", bi);
+                        for (const int32_t c : B.cands) std::printf(" %d:%.6f", (int) c, (double) row[(size_t) c] - lse);
+                        std::printf("\n");
+                    }
+                    // a T=1 window commits itself, and a long branch committed its windows: the trunk comes back
+                    if (!ver.wait_commit(err) || !gpu_sync_ok() || !checkpoint_restore(trunk, ss, g)) {
+                        std::printf("ERR score: restoring the trunk failed%s%s\n", ckpt_why.c_str(), err.c_str());
+                        return 1;
+                    }
+                }
+                std::fflush(stdout);
+            }
             // ======== --pipeline-windows 2: the decode windows with the two cards overlapped ========
             // Stage 0 (the first card) runs window K+1 while stage 1 verifies window K, on the guess that K is accepted
             // whole and that its bonus token is the drafter's.  The drafter, teacher-forced through K+1's drafts,
@@ -11207,7 +11332,7 @@ int main(int argc, char** argv) {
                     std::fprintf(stderr, "strata serve: --pipeline-windows: a request with %s decodes serially\n",
                                  pl_serial);
             }
-            if (pl_want && pl_serial == nullptr && !cancelled && produced_n < max_new) {
+            if (pl_want && pl_serial == nullptr && !cancelled && !scored && produced_n < max_new) {
                 pl_ran = true;
                 if (!pl_prepare(err)) {
                     std::printf("ERR %s\n", err.c_str());
@@ -11842,7 +11967,7 @@ int main(int argc, char** argv) {
                     std::fprintf(stderr, "strata pipeline calibration (p_on decile: on/scored):%s\n", cal.c_str());
                 }
             }
-            while (!pl_ran && !cancelled && produced_n < max_new) {
+            while (!pl_ran && !cancelled && !scored && produced_n < max_new) {
                 int T = use_mtp ? S_mtp : 1;   // no --mtp: one token a round unless a lookup draft fires
                 if (use_mtp && req_spec_min_p > 0.0) {
                     T = 1;
