@@ -60,6 +60,11 @@ bool conversation_checkpoint_save(ConversationCheckpoint& checkpoint, const Sess
                                   const ModelGeometry& g, std::string& error);
 bool conversation_checkpoint_restore(const ConversationCheckpoint& checkpoint, SessionState& session,
                                      const ModelGeometry& g, std::string& error);
+/// The restore above minus the recurrent (GDN) copy: for a session whose recurrent state provably did not change
+/// since the checkpoint was saved (e.g. after an uncommitted verify window).  The PLE history, the previous-token
+/// pair and the indexer running state are restored as usual.
+bool conversation_checkpoint_restore_running(const ConversationCheckpoint& checkpoint, SessionState& session,
+                                             const ModelGeometry& g, std::string& error);
 
 struct ConversationView {
     const std::vector<int32_t>& ids;

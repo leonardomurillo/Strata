@@ -657,6 +657,9 @@ class StrataEngine:
         self.ended, self.unloaded = True, True
         self.max_context = int(args[args.index("--max-context") + 1]) if "--max-context" in args else 4096
         self.spec_rows = int(args[args.index("--spec") + 1]) if "--spec" in args else 4   # verify-window rows
+        # decision scoring window rows (engine default 8)
+        self.score_rows = (min(8, max(2, int(args[args.index("--score-rows") + 1])))
+                           if "--score-rows" in args else 8)
         self.can_stop = False            # the engine honours a STOP line mid-request (READY <ctx> stop)
         self.last = {}
         self.info = {}                   # INFO key=value facts (engine 0.1.8+): kv, expert slots, ... (Monitor tab)
