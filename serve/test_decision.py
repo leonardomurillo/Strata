@@ -181,7 +181,7 @@ class Api(unittest.TestCase):
         self.assertEqual(set(r), {"decision", "fields", "usage"})
         self.assertEqual(set(r["decision"]), set(SCHEMA))
         self.assertEqual(set(r["fields"]["score"]), {"value", "probability", "scored_nodes", "tree",
-                                                     "interval_p10_p90"})
+                                                     "interval_p10_p90", "options"})
         self.assertNotIn("interval_p10_p90", r["fields"]["category"])
         self.assertEqual(set(r["usage"]), {"context_tokens", "scored_rows"})
         self.assertEqual(set(out["usage"]), {"prompt_tokens", "cached_tokens", "context_tokens", "scored_rows"})
@@ -289,6 +289,108 @@ class Plain(unittest.TestCase):
         self.assertTrue(all(special(p) == 0 for p in plan.paths))
         # control: the same text unprotected does become special tokens
         self.assertGreater(special(tok.encode(every, parse_special=True)), 0)
+
+
+class Options(unittest.TestCase):
+    def test_tree_fields_list_every_option_in_the_callers_order_and_greedy_fields_do_not(self):
+        svc, _ = rig()
+        job = decision.prepare(svc, {"schema": SCHEMA, "contexts": ["x"]})
+        fields = decision.run(svc, job)["results"][0]["fields"]
+        for name, spec in SCHEMA.items():
+            f = fields[name]
+            self.assertEqual([o["value"] for o in f["options"]],
+                             [s for s in decision.compile_schema(SCHEMA) if s.name == name][0].values)
+            self.assertAlmostEqual(sum(o["probability"] for o in f["options"]), 1.0, places=4)
+            if "aggregate" not in spec:
+                best = max(f["options"], key=lambda o: o["probability"])
+                self.assertEqual(f["value"], best["value"])
+        self.assertEqual([o["value"] for o in fields["category"]["options"]], ["billing", "technical", "other"])
+        self.assertEqual([o["value"] for o in fields["urgent"]["options"]], [True, False])
+        greedy = decision.run(svc, decision.prepare(svc, {"schema": SCHEMA, "contexts": ["x"], "mode": "greedy"}))
+        self.assertTrue(all("options" not in f for f in greedy["results"][0]["fields"].values()))
+
+    def test_words_is_the_default_and_leaves_the_prompts_unchanged(self):
+        svc, _ = rig()
+        base = {"schema": SCHEMA, "contexts": ["a", "b"], "instructions": "Be brief."}
+        a, b = decision.prepare(svc, base), decision.prepare(svc, {**base, "labels": "words"})
+        self.assertEqual(a["prompts"], b["prompts"])
+        self.assertEqual([(p.suffix, p.paths) for p in a["plans"]], [(p.suffix, p.paths) for p in b["plans"]])
+        text = bytes(t for t in a["prompts"][0] if t < 256).decode("utf-8", "replace")
+        self.assertIn('Allowed values: "billing", "technical", "other"', text)
+        self.assertIn("Respond with the JSON value only.", text)
+
+
+class Numbers(unittest.TestCase):
+    ENUM = {"c": field("kind", type="enum", choices=["billing", "technical", "other"])}
+
+    def ask(self, schema, table, **kw):
+        svc, _ = rig(lambda tok: Table(tok, table))
+        job = decision.prepare(svc, {"schema": schema, "contexts": ["x"], "labels": "numbers", **kw})
+        return svc, job, decision.run(svc, job)["results"][0]["fields"]
+
+    def test_labels_are_scored_but_the_caller_sees_its_own_values(self):
+        table = {48: math.log(0.1), 49: math.log(0.7), 50: math.log(0.2)}
+        svc, job, f = self.ask(self.ENUM, table)
+        self.assertEqual(f["c"]["value"], "technical")
+        self.assertEqual([o["value"] for o in f["c"]["options"]], ["billing", "technical", "other"])
+        for o, want in zip(f["c"]["options"], [0.1, 0.7, 0.2]):
+            self.assertAlmostEqual(o["probability"], want, places=4)
+        text = bytes(t for t in job["prompts"][0] if t < 256).decode("utf-8", "replace")
+        self.assertIn('Allowed values: 0 = "billing", 1 = "technical", 2 = "other"', text)
+        self.assertIn("respond with the number of the chosen value only", text)
+
+    def test_a_boolean_is_true_then_false_and_integers_keep_their_numerals(self):
+        schema = {"b": field(type="boolean"), "n": field(type="integer", minimum=1, maximum=3)}
+        table = {48: math.log(0.2), 49: math.log(0.8), 50: math.log(0.1), 51: math.log(0.1), 52: math.log(0.1)}
+        svc, job, f = self.ask(schema, table)
+        self.assertIs(f["b"]["value"], False)
+        self.assertEqual([o["value"] for o in f["b"]["options"]], [True, False])
+        self.assertEqual([o["value"] for o in f["n"]["options"]], [1, 2, 3])
+        text = bytes(t for t in job["prompts"][0] if t < 256).decode("utf-8", "replace")
+        self.assertIn("Allowed values: 0 = true, 1 = false", text)
+        self.assertIn("Allowed values: 1, 2, 3", text)
+
+    def test_bad_label_requests_are_a_400(self):
+        svc, _ = rig()
+        eleven = {"e": field(type="enum", choices=[f"v{i}" for i in range(11)])}
+        for bad in ({"labels": "fast"}, {"labels": 1}, {"schema": eleven, "labels": "numbers"},
+                    {"schema": {"n": field(type="integer", minimum=1, maximum=11)}, "labels": "numbers"}):
+            with self.assertRaises(ValueError, msg=bad):
+                decision.prepare(svc, {"schema": SCHEMA, "contexts": ["x"], **bad})
+        ok = {"e": field(type="enum", choices=[f"v{i}" for i in range(10)])}
+        decision.prepare(svc, {"schema": ok, "contexts": ["x"], "labels": "numbers"})
+        decision.prepare(svc, {"schema": eleven, "contexts": ["x"]})            # words mode has no such cap
+
+    def test_a_label_that_is_not_a_single_token_is_refused(self):
+        class Merging(Tok):
+            def encode(self, text, parse_special=False, plain=()):               # labels 1 and 2 share a first token
+                ids = super().encode(text, parse_special=parse_special, plain=plain)
+                return [t for i in ids for t in ([7, i] if i in (49, 50) else [i])]
+        tok = Merging()
+        svc = Service(MockEngine(tok, "Fine.", max_context=16384), tok, ChatTemplate(ROOT / "serve/chat_template.jinja"))
+        with self.assertRaisesRegex(ValueError, "single tokens"):
+            decision.prepare(svc, {"schema": self.ENUM, "contexts": ["x"], "labels": "numbers"})
+
+    def test_option_text_stays_plain_in_numbers_mode(self):
+        svc, _ = rig()
+        every = "".join(TAGS)
+        choices = [every, "b"] + TAGS
+        job = decision.prepare(svc, {"schema": {"a": field(every, type="enum", choices=choices)},
+                                     "instructions": every, "contexts": [every], "labels": "numbers"})
+        plain = decision.prepare(svc, {"schema": {"a": field("d", type="enum", choices=["v", "b"])},
+                                       "instructions": "i", "contexts": ["c"], "labels": "numbers"})
+        special = lambda ids: sum(1 for t in ids if t >= 256)                    # noqa: E731
+        self.assertEqual(special(job["prompts"][0]), special(plain["prompts"][0]))
+        self.assertTrue(all(special(p) == 0 for p in job["plans"][0].paths))
+
+    def test_score_rows_sets_the_window_estimate(self):
+        schema = {k: field(type="boolean") for k in "abc"}
+        body = {"schema": schema, "contexts": ["c"] * 64}                        # 384 windows at the default rows
+        svc, _ = rig()
+        with self.assertRaisesRegex(ValueError, "too many branch windows"):
+            decision.prepare(svc, body)
+        svc.engine.score_rows = 8
+        self.assertEqual(decision.prepare(svc, body)["windows"], 192)
 
 
 if __name__ == "__main__":
