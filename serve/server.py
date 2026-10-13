@@ -64,6 +64,7 @@ from serve.winjob import contain  # noqa: E402
 from serve.structured import StructuredOutputError, prepare_format, validated_json  # noqa: E402
 from serve.structured import _extract_json  # noqa: E402
 from serve import responses as responses_api  # noqa: E402
+from serve import decision as decision_api  # noqa: E402
 from serve.responses import ResponsesError, error_body as responses_error_body  # noqa: E402
 
 IM_END = "<|im_end|>"
@@ -295,6 +296,12 @@ class MockEngine:
             if self.delay:
                 time.sleep(self.delay)
             yield t
+
+    def score(self, ids, branches, cancel, pin=0, timeout_s=600.0):
+        """decisions without a GPU: a candidate's log-probability depends on its branch's tokens and its id only (never
+        on the prompt or another branch), so fields stay independent.  -> (per branch {candidate: logprob}, DONE)."""
+        self.scored = [list(b) for b in branches]
+        return [{c: -((sum(toks) * 31 + c * 17) % 53) / 8.0 for c in cands} for toks, cands in branches],             "DONE 0 %d 1.0 2.0 score 0 0 0" % len(ids)
 
 
 class EngineDied(RuntimeError):
@@ -649,6 +656,7 @@ class StrataEngine:
         self.proc, self.pump, self.log = None, None, None
         self.ended, self.unloaded = True, True
         self.max_context = int(args[args.index("--max-context") + 1]) if "--max-context" in args else 4096
+        self.spec_rows = int(args[args.index("--spec") + 1]) if "--spec" in args else 4   # verify-window rows
         self.can_stop = False            # the engine honours a STOP line mid-request (READY <ctx> stop)
         self.last = {}
         self.info = {}                   # INFO key=value facts (engine 0.1.8+): kv, expert slots, ... (Monitor tab)
@@ -3567,57 +3575,6 @@ class Service:
                     content[n] = {"type": "text", "text": f"[image omitted: {why}]"}
         return fetched
 
-    def decide_spike(self, req: dict) -> dict:
-        """SPIKE ONLY (POST /strata/score): one decision's timing on the real engine.  {system, user, fields: [{suffix,
-        options}], pin_head, lead} -> per field its options' probabilities (softmax over each option's first token)
-        and the engine time.  serve/decision.py replaces this with the full schema compiler."""
-        tok = self.tok
-
-        def ids_of(msgs):
-            body = {"messages": msgs, "chat_template_kwargs": {"enable_thinking": False}}
-            messages, tools, kw = openai_to_messages(body)
-            return list(self.prepare(messages, None, kw, 1, req=body)[0])
-
-        system = {"role": "system", "content": str(req.get("system") or "")}
-        ids = ids_of([system, {"role": "user", "content": str(req.get("user") or "")}])
-        ids += tok.encode(str(req.get("lead", "{\n")))
-        pin = 0
-        if req.get("pin_head"):
-            head = ids_of([system, {"role": "user", "content": ""}])
-            pin = next((i for i, (a, b) in enumerate(zip(ids, head)) if a != b), min(len(ids), len(head)))
-            pin = pin if 0 < pin < len(ids) - 1 else 0
-        branches, names = [], []
-        for f in req.get("fields") or []:
-            cands = [tok.encode(str(o))[0] for o in f["options"]]
-            if len(set(cands)) != len(cands):
-                raise ValueError(f"options {f['options']}: their first tokens collide (the spike scores first tokens)")
-            branches.append((tok.encode(str(f["suffix"])), cands))
-            names.append([str(o) for o in f["options"]])
-        if not branches:
-            raise ValueError("fields: one or more")
-        if not self.fifo.acquire(timeout=600):
-            raise ModelBusy("a request is running or queued")
-        try:
-            self.ensure_loaded()
-            t0 = time.perf_counter()
-            res, done = self.engine.score(ids, branches, threading.Event(), pin=pin)
-            ms = (time.perf_counter() - t0) * 1000.0
-            self.last_request_at = time.time()
-        finally:
-            self.fifo.release()
-        fields = []
-        for opts, r, (_, cands) in zip(names, res, branches):
-            if r is None:
-                fields.append(None)
-                continue
-            lps = [r.get(c, float("-inf")) for c in cands]
-            top = max(lps)
-            ex = [math.exp(v - top) for v in lps]
-            z = sum(ex)
-            fields.append({o: round(e / z, 4) for o, e in zip(opts, ex)})
-        return {"fields": fields, "ms": round(ms, 1), "prompt_tokens": len(ids), "branches": len(branches),
-                "pin": pin, "done": done}
-
     def prepare(self, messages, tools, kwargs, max_new=None, force=None, req=None):
         """-> (ids, thinking, max_new). An unset or non-positive max_new (some clients send -1) means "unlimited":
         the rest of the context.  `force` (forced_call): without thinking the reply starts with it, so it ends the
@@ -5396,10 +5353,24 @@ def make_handler(svc: Service):
                     self._anthropic(req)
                 elif path == "/v1/messages/count_tokens":
                     self._count_tokens(req)
-                elif path == "/strata/score":                # SPIKE ONLY (decisions): see Service.decide_spike
-                    self._json(200, svc.decide_spike(req))
+                elif path == "/v1/decision":                 # serve/decision.py: a schema answered by scoring
+                    if req.get("model") not in (None, *svc.model_names()):
+                        self._json(404, {"error": {"message": "model not found"}})
+                        return
+                    job = decision_api.prepare(svc, req)     # a bad request never waits for the engine's turn
+                    if not svc.fifo.acquire(timeout=600):
+                        raise ModelBusy("a request is running or queued")
+                    try:
+                        svc.ensure_loaded()
+                        out = decision_api.run(svc, job)
+                        svc.last_request_at = time.time()
+                    finally:
+                        svc.fifo.release()
+                    self._json(200, out)
                 else:
                     self._json(404, {"error": {"message": "not found"}})
+            except decision_api.NonFinite as e:             # a decision row held a NaN: not the request's fault
+                self._json(503, {"error": {"type": "server_error", "message": str(e)}})
             except EngineNonFinite as e:                    # #879, twice: not the request's fault
                 print(f"[strata] 503: {e}", flush=True)
                 self._json(503, responses_error_body(str(e), "server_error") if path == "/v1/responses"
@@ -5466,6 +5437,7 @@ def make_handler(svc: Service):
                      "total_slots": max(1, int(getattr(svc.engine, "batch", 0) or 0)),   # #1004: the batch slots
                      "model_alias": svc.model, "chat_template": svc.template.source,
                      "chat_template_caps": svc.template.caps,
+                     "decision": True,                                  # POST /v1/decision (serve/decision.py)
                      "modalities": {"vision": svc.vision is not None}, "models_autoload": hasattr(svc.engine, "restart"),
                      "is_sleeping": not svc.loaded()}
             if getattr(svc.engine, "model_path", None):
