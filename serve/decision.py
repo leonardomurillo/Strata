@@ -28,8 +28,8 @@ MAX_DIGITS, MAX_LETTERS = 10, 26     # enum/boolean options are scored as labels
 MARK_L, MARK_R = chr(0xF0EA0), chr(0xF0EA1)                 # private use: not whitespace, so no template trims it
 SYSTEM_MARK, CONTEXT_MARK = MARK_L + "decision-system" + MARK_R, MARK_L + "decision-context" + MARK_R
 SYSTEM_HEAD = ("Select the requested field value from its allowed values, based on the context. "
-               "Each labelled value is chosen by its label: respond with the label of the chosen value only; "
-               "a field without labels takes the value itself.\n\nFields:\n")
+               "Where the allowed values are numbered or lettered, respond with the number or letter of the chosen "
+               "value only; otherwise respond with the JSON value only.\n\nFields:\n")
 
 
 class NonFinite(ArithmeticError):
