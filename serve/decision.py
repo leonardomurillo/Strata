@@ -20,10 +20,14 @@ import time
 MAX_FIELDS, MAX_VALUES, MAX_CONTEXTS = 32, 255, 64
 MAX_NAME, MAX_VALUE, MAX_TEXT, MAX_SYSTEM = 64, 256, 16384, 262144   # bytes; the instructions + catalogue, in chars
 MAX_WINDOWS, MAX_BRANCH_TOKENS, DEFAULT_ROWS = 256, 256, 4
+MAX_LABELS, DEFAULT_LABELS = 10, "words"                    # "numbers": options are scored as the labels 0-9
 MARK_L, MARK_R = chr(0xF0EA0), chr(0xF0EA1)                 # private use: not whitespace, so no template trims it
 SYSTEM_MARK, CONTEXT_MARK = MARK_L + "decision-system" + MARK_R, MARK_L + "decision-context" + MARK_R
 SYSTEM_HEAD = ("Select the requested field value from its allowed values, based on the context. "
                "Respond with the JSON value only.\n\nFields:\n")
+NUMBERS_HEAD = ("Select the requested field value from its allowed values, based on the context. "
+                "Where the allowed values are numbered, respond with the number of the chosen value only; "
+                "otherwise respond with the JSON value only.\n\nFields:\n")
 
 
 class NonFinite(ArithmeticError):
@@ -43,9 +47,10 @@ def _ids(tok, text: str, parse_special=False, plain=None) -> list[int]:
 class _Spec:
     """One compiled field: its allowed values (as JSON values), their encoded text, and how to aggregate."""
 
-    def __init__(self, name, type_, description, values, encoded, numbers, aggregate):
+    def __init__(self, name, type_, description, values, encoded, numbers, aggregate, shown=None, labelled=False):
         self.name, self.type, self.description = name, type_, description
         self.values, self.encoded, self.numbers, self.aggregate = values, encoded, numbers, aggregate
+        self.shown, self.labelled = encoded if shown is None else shown, labelled   # shown: the options' JSON text
 
 
 def _places(x: float) -> int:
@@ -64,7 +69,7 @@ def _is_num(x) -> bool:
     return isinstance(x, (int, float)) and not isinstance(x, bool) and math.isfinite(x)
 
 
-def _make_field(name: str, spec: dict, json_schema: bool) -> _Spec:
+def _make_field(name: str, spec: dict, json_schema: bool, labels: str = DEFAULT_LABELS) -> _Spec:
     err = lambda why: ValueError(f'field "{name}": {why}')          # noqa: E731
     if len(name.encode("utf-8")) > MAX_NAME or not name:
         raise ValueError(f"a field name is 1-{MAX_NAME} bytes")
@@ -115,11 +120,17 @@ def _make_field(name: str, spec: dict, json_schema: bool) -> _Spec:
     agg = spec.get("aggregate", spec.get("x-aggregate", "mode"))
     if agg != "mode" and not (numbers and agg in ("median", "mean")):
         raise err("aggregate must be mode, or median/mean for numeric fields")
+    shown, labelled = encoded, False
+    if labels == "numbers":
+        if len(values) > MAX_LABELS:
+            raise err(f"numbered labels allow at most {MAX_LABELS} allowed values")
+        if typ in ("boolean", "enum", "choice", "selection"):
+            encoded, labelled = [str(k) for k in range(len(values))], True
     return _Spec(name, typ if typ in ("boolean", "integer", "number") else "enum", description, values, encoded,
-                 numbers, agg)
+                 numbers, agg, shown, labelled)
 
 
-def compile_schema(schema) -> list[_Spec]:
+def compile_schema(schema, labels: str = DEFAULT_LABELS) -> list[_Spec]:
     if not isinstance(schema, dict):
         raise ValueError('"schema" must be an object')
     json_schema = "properties" in schema
@@ -130,7 +141,7 @@ def compile_schema(schema) -> list[_Spec]:
     for name, spec in props.items():
         if not isinstance(spec, dict):
             raise ValueError(f'field "{name}" must be an object')
-        out.append(_make_field(name, spec, json_schema))
+        out.append(_make_field(name, spec, json_schema, labels))
     return out
 
 
@@ -269,14 +280,23 @@ def prepare(svc, req: dict) -> dict:
         raise ValueError(f'"contexts" must be a list of 1-{MAX_CONTEXTS} strings')
     if not all(isinstance(c, str) and c.strip() for c in contexts):
         raise ValueError("every context must be a non-empty string")
-    specs = compile_schema(schema)
+    labels = req.get("labels", DEFAULT_LABELS)
+    if labels not in ("words", "numbers"):
+        raise ValueError('"labels" must be words or numbers')
+    specs = compile_schema(schema, labels)
+    allowed = lambda s: ", ".join(f"{k} = {t}" for k, t in enumerate(s.shown)) if s.labelled else \
+        ", ".join(s.encoded)                                        # noqa: E731
     catalog = "\n".join(_json_text(s.name) + (": " + s.description if s.description else "") +
-                        "\nAllowed values: " + ", ".join(s.encoded) for s in specs)
-    system = SYSTEM_HEAD + catalog + "\n" + instructions
+                        "\nAllowed values: " + allowed(s) for s in specs)
+    system = (NUMBERS_HEAD if labels == "numbers" else SYSTEM_HEAD) + catalog + "\n" + instructions
     if len(system) > MAX_SYSTEM:
         raise ValueError(f"the schema and instructions are too long ({MAX_SYSTEM} characters at most)")
     plans = [_Plan(svc.tok, s, mode, tree_max) for s in specs]
-    rows = max(1, int(getattr(svc.engine, "spec_rows", DEFAULT_ROWS) or DEFAULT_ROWS))
+    if any(p.spec.labelled and len({q[0] for q in p.paths}) != len(p.paths) for p in plans):
+        raise ValueError("numbered labels must be single tokens")
+    score_rows = getattr(svc.engine, "score_rows", None)
+    rows = score_rows if _is_int(score_rows) and score_rows >= 1 else \
+        max(1, int(getattr(svc.engine, "spec_rows", DEFAULT_ROWS) or DEFAULT_ROWS))
     windows = len(contexts) * sum(p.windows(rows) for p in plans)
     if windows > MAX_WINDOWS:
         raise ValueError(f"too many branch windows ({windows}; {MAX_WINDOWS} at most): fewer contexts, fields or "
@@ -404,4 +424,6 @@ def _assemble(plans, probs, walks) -> dict:
         decision[sp.name] = sp.values[idx]
         fields[sp.name] = {"value": sp.values[idx], "probability": pr[idx] if pr else w.score,
                            "scored_nodes": len(p.nodes) if p.tree else w.scored, "tree": p.tree, **entry}
+        if pr:
+            fields[sp.name]["options"] = [{"value": v, "probability": q} for v, q in zip(sp.values, pr)]
     return {"decision": decision, "fields": fields}
