@@ -319,7 +319,7 @@ class Options(unittest.TestCase):
         self.assertIn('Allowed values: 0 = "billing", 1 = "technical", 2 = "other"', text)
         self.assertIn("Allowed values: 0 = true, 1 = false", text)
         self.assertIn("Allowed values: 1, 2, 3, 4, 5, 6, 7, 8, 9", text)          # numeric fields: the numbers
-        self.assertIn("respond with the label of the chosen value only", text)
+        self.assertIn("respond with the number or letter of the chosen value only", text)
 
 
 class Labels(unittest.TestCase):
