@@ -97,6 +97,8 @@ public:
     /// Diagnostics: row `t` of the last window's head logits (n_vocab floats) to the host. Valid after run().
     bool copy_logits(int t, float* host) const;
     int64_t vocab() const { return next_ ? next_->vocab() : n_vocab_; }
+    /// The largest window init() sized this verifier for (0 before init).
+    int max_t() const { return max_t_; }
     /// #879 GUARD: the first row of the last finished window (run, run_slot_rows, batch_poll, pl_finish) whose head
     /// logits held a NaN or an infinity, else -1; nonfinite_pos() is that row's position.  Every window graph
     /// checks its T rows on the device beside the greedy pick (logits_nonfinite_rows into mapped flags, read after

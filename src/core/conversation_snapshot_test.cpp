@@ -144,6 +144,22 @@ void full_session(int fmt, int mode, int experts) {
     checkpoint.ids.assign(ids.begin(),ids.begin()+3);
     check(conversation_checkpoint_save(checkpoint,ss,g,err),"save complete running checkpoint");
     checkpoint.used = 17;
+    {
+        // restore_running puts back everything but the recurrent state; the full restore puts that back too
+        const ConversationCheckpoint& ck = checkpoint;
+        ConversationCheckpoint probe;
+        probe.ids = ck.ids;
+        fill(177);
+        check(conversation_checkpoint_restore_running(ck,ss,g,err),"restore running checkpoint without the recurrent state");
+        check(conversation_checkpoint_save(probe,ss,g,err),"read back after the partial restore");
+        check(probe.gdn!=ck.gdn,"partial restore leaves the recurrent state alone");
+        check(probe.ple==ck.ple && probe.tails==ck.tails && probe.dead==ck.dead && probe.block_pos==ck.block_pos,
+              "partial restore puts back the PLE history and the indexer running state");
+        check(ss.ple_prev[0]==2 && ss.ple_prev[1]==3,"partial restore rebuilds the PLE token window");
+        check(conversation_checkpoint_restore(ck,ss,g,err),"full restore after the partial one");
+        check(conversation_checkpoint_save(probe,ss,g,err) && probe.gdn==ck.gdn,"full restore puts the recurrent state back");
+        fill(13);
+    }
     checkpoints.push_back(std::move(checkpoint));
     const ConversationView view{ids,images,checkpoints,true};
     SavedConversation a,b,restored;

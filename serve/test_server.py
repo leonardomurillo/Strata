@@ -5346,5 +5346,16 @@ class UntimedReads(unittest.TestCase):
         self.assertEqual(v._readline(5.0, "x"), "OK 7 1 1 1\n")
 
 
+class ScoreRows(unittest.TestCase):
+    def rows(self, *args):
+        return StrataEngine("missing-executable", list(args), lazy=True).score_rows
+
+    def test_default_and_clamp(self):
+        self.assertEqual(self.rows(), 8)
+        self.assertEqual(self.rows("--score-rows", "5"), 5)
+        self.assertEqual(self.rows("--score-rows", "1"), 2)
+        self.assertEqual(self.rows("--score-rows", "99"), 8)
+
+
 if __name__ == "__main__":
     unittest.main()

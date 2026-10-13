@@ -170,13 +170,13 @@ bool conversation_checkpoint_save(ConversationCheckpoint& c, const SessionState&
     return true;
 }
 
-bool conversation_checkpoint_restore(const ConversationCheckpoint& c, SessionState& ss,
-                                     const ModelGeometry& g, std::string& error) {
+static bool checkpoint_restore_impl(const ConversationCheckpoint& c, SessionState& ss,
+                                    const ModelGeometry& g, bool with_gdn, std::string& error) {
     if (!conversation_checkpoint_validate(c, ss, g, error)) return false;
     ConversationStateSizes z;
     if (!conversation_session_sizes(g, ss, z, error)) return false;
     if (!sync(error)) return false;   // the copies below no longer ride the legacy stream's implicit ordering
-    if (!copy(ss.gdn_state, c.gdn.data(), c.gdn.size(), error) ||
+    if ((with_gdn && !copy(ss.gdn_state, c.gdn.data(), c.gdn.size(), error)) ||
         !copy(ss.ple_hist, c.ple.data(), c.ple.size(), error)) return false;
     for (size_t j = 0; j < owned_qsa(ss); ++j) {
         const auto& st = owned(ss, j);
@@ -192,6 +192,16 @@ bool conversation_checkpoint_restore(const ConversationCheckpoint& c, SessionSta
     ss.ple_prev[0] = tokens >= 2 ? c.ids[tokens - 2] : -1;
     ss.ple_prev[1] = tokens >= 1 ? c.ids[tokens - 1] : -1;
     return sync(error);
+}
+
+bool conversation_checkpoint_restore(const ConversationCheckpoint& c, SessionState& ss,
+                                     const ModelGeometry& g, std::string& error) {
+    return checkpoint_restore_impl(c, ss, g, true, error);
+}
+
+bool conversation_checkpoint_restore_running(const ConversationCheckpoint& c, SessionState& ss,
+                                             const ModelGeometry& g, std::string& error) {
+    return checkpoint_restore_impl(c, ss, g, false, error);
 }
 
 bool conversation_snapshot_bytes(const ConversationView& view, const SessionState& ss,

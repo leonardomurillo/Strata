@@ -550,6 +550,9 @@ struct Options {
     /// sent as `BGEN <slot> <max_new> ...` reads its prompt and its first token through the usual path, then
     /// continues in slot <slot> of the batch windows (`BT <slot> <id>` lines, then `BDONE <slot> ...`).
     int batch = 0;
+    /// --serve decision scoring (score=): windows of up to this many rows (2..8); a branch that fits one window
+    /// never commits, so its trunk restore skips the recurrent-state copy.
+    int score_rows = 8;
     /// With an explicit --layer-split, every GPU loads only its own layers' dense weights instead of the whole
     /// model's: the VRAM they took goes back to the expert cache (opt-in)
     bool trim_stage_weights = false;
@@ -804,6 +807,8 @@ void usage() {
                  "  --mtp-max-t M        cap the MTP's windows at M tokens (0 = --spec; longer ones come from suffixes)\n"
                  "  --spec N             the MTP drafter's verify window: how many tokens it proposes per check (setup\n"
                  "                       writes 4; --suffix-draft lets it grow by 2, up to 8, where a repeat is likely)\n"
+                 "  --score-rows N       --serve: decision scoring windows of up to N rows (2..8, default 8); a branch that\n"
+                 "                       fits one window skips the recurrent-state copy back\n"
                  "  --spec-min-p P       how sure the draft layer must be to extend a verify window by another guess\n"
                  "                       (setup writes 0.5; --calibrate measures it on this PC, see docs/DETAILS.md)\n"
                  "  --lookup-chain K     opt-in: after the MTP's drafts, add up to K prompt-lookup drafts that continue\n"
@@ -1473,6 +1478,14 @@ bool checkpoint_restore(const ConvCheckpoint& c, strata::core::SessionState& ss,
     return false;
 }
 
+/// checkpoint_restore without the recurrent-state copy: only after windows that never committed.
+bool checkpoint_restore_running(const ConvCheckpoint& c, strata::core::SessionState& ss, const strata::core::ModelGeometry& g) {
+    std::string error;
+    if (strata::core::conversation_checkpoint_restore_running(c, ss, g, error)) return true;
+    std::fprintf(stderr, "strata serve: checkpoint restore: %s\n", error.c_str());
+    return false;
+}
+
 // --control-vector-scaled: llama.cpp's `common_control_vector_load` (every file's `direction.<l>` times its scale,
 // summed; layer 0 has none) and `llama_adapter_cvec::apply` with the projection-mode patch (project: the unit
 // direction and its norm as the scale), into the tables `cvec_upload` takes.  `summary` is what INFO reports;
@@ -1977,6 +1990,7 @@ int main(int argc, char** argv) {
         else if (a == "--prefill-until") o.prefill_until = std::atoll(next("--prefill-until"));
         else if (a == "--dump-final-r") o.dump_final_r = next("--dump-final-r");
         else if (a == "--spec") o.spec = std::atoi(next("--spec"));
+        else if (a == "--score-rows") o.score_rows = std::min(8, std::max(2, std::atoi(next("--score-rows"))));   // kVerifyMaxT
         else if (a == "--batch") o.batch = std::atoi(next("--batch"));
         else if (a == "--slots") o.batch = std::atoi(next("--slots"));   // the same as --batch
         else if (a == "--trim-stage-weights") o.trim_stage_weights = true;
@@ -7536,12 +7550,21 @@ int main(int argc, char** argv) {
         }
         ver.set_remote_expert_opt(remote_opt.get());
         if (batch_mtp) ver.set_batch_graph_limit(64);   // --batch-mtp only: slot rotation makes many layouts (LRU); 0.1.39 keeps all
-        if (!ver.init(wt, g, ss, vh, native_head.loaded() ? &native_head : nullptr,
-                      batch_mtp ? strata::kernels::kVerifyMaxT : std::max(o.spec, o.batch), err) ||
+        // decision scoring (score=, single stage only) wants windows of up to --score-rows rows; decode keeps its S
+        const int ver_rows = batch_mtp ? strata::kernels::kVerifyMaxT
+                           : (o.batch == 0 && n_stages == 1) ? std::max(o.spec, o.score_rows)
+                           : std::max(o.spec, o.batch);
+        if (!ver.init(wt, g, ss, vh, native_head.loaded() ? &native_head : nullptr, ver_rows, err) ||
             (use_mtp && !mtp.bind(last_st ? last_st->wt : wt, last_st ? &last_st->head : &native_head,
                                   pipe ? pl_mtp_R : ver.final_R_all(), err))) {
             std::fprintf(stderr, "strata serve: %s\n", err.c_str());
             return 1;
+        }
+        {
+            size_t fb_v = 0, tb_v = 0;
+            cudaMemGetInfo(&fb_v, &tb_v);
+            std::fprintf(stderr, "strata serve: verify windows up to %d rows (decision scoring), %.0f MiB free\n",
+                         ver_rows, (double) fb_v / (1024.0 * 1024.0));
         }
         if (pipe) mtp.set_source_R(ver.final_R_all());   // the serial decode's rows (the last stage's even verifier)
         auto free_slot_mtp_rows = [](float* p) { if (p != nullptr) (void) cudaFree(p); };
@@ -11247,6 +11270,9 @@ int main(int argc, char** argv) {
                 scored = true;
                 finish = "score";
                 ConvCheckpoint trunk;
+                // the tokens the state holds: a restore sets the PLE token pair and the indexer's pooled row from them
+                // (without them every branch after the first ran with no previous tokens)
+                trunk.ids = consumed;
                 if (!ver.wait_commit(err) || !gpu_sync_ok() || !checkpoint_save(trunk, ss, g)) {
                     std::printf("ERR score: saving the trunk failed%s%s\n", ckpt_why.c_str(), err.c_str());
                     return 1;
@@ -11256,8 +11282,17 @@ int main(int argc, char** argv) {
                     explicit NoHeadSampling(strata::core::Verifier& x) : v(x) { v.set_head_sampling(false); }
                     ~NoHeadSampling() { v.set_head_sampling(true); }
                 } no_head(ver);
+                // the trunk's GDN copy-out could be skipped when every branch is fast; not done here
+                // STRATA_SCORE_FULL=1: the windows of a decode (S rows) and the full restore after every branch
+                // (the oracle for the fast path); STRATA_SCORE_CHECK=1: compare the device GDN state with the trunk's
+                // after each fast branch
+                const bool score_full = [] { const char* v = std::getenv("STRATA_SCORE_FULL"); return v != nullptr && v[0] == '1'; }();
+                const bool score_check = [] { const char* v = std::getenv("STRATA_SCORE_CHECK"); return v != nullptr && v[0] == '1'; }();
+                const int64_t W = score_full ? (int64_t) std::max(S, 1)
+                                             : (int64_t) std::min(8, std::max(2, std::min(ver.max_t(), o.score_rows)));   // kVerifyMaxT
                 std::vector<float> row((size_t) ver.vocab());
-                std::vector<int32_t> seq, outw((size_t) std::max(S, 1));
+                std::vector<int32_t> seq, outw((size_t) std::max<int64_t>(W, 1));
+                std::vector<uint8_t> gdn_now;
                 for (size_t bi = 0; bi < score_branches.size(); ++bi) {
                     if (stop_req.load()) { finish = "cancel"; break; }
                     const ScoreBranch& B = score_branches[bi];
@@ -11269,9 +11304,12 @@ int main(int argc, char** argv) {
                         std::printf("ERR the K/V cannot grow: no VRAM is left\n");
                         return 1;
                     }
+                    // A branch of 2..W rows is one window that is never committed: run() leaves the recurrent state
+                    // untouched (commit writes it) and only a T=1 window commits itself, so its restore may skip it.
+                    const bool fast = !score_full && L >= 2 && L <= W;
                     bool row_ok = false;
                     for (int64_t at = 0;;) {
-                        const int T = (int) std::min<int64_t>((int64_t) std::max(S, 1), L - at);
+                        const int T = (int) std::min<int64_t>(W, L - at);
                         drive.d.layers = 0;
                         drive.d.experts = 0;
                         drive.d.failed = false;
@@ -11306,7 +11344,20 @@ int main(int argc, char** argv) {
                         std::printf("\n");
                     }
                     // a T=1 window commits itself, and a long branch committed its windows: the trunk comes back
-                    if (!ver.wait_commit(err) || !gpu_sync_ok() || !checkpoint_restore(trunk, ss, g)) {
+                    if (!ver.wait_commit(err) || !gpu_sync_ok()) {
+                        std::printf("ERR score: restoring the trunk failed%s%s\n", ckpt_why.c_str(), err.c_str());
+                        return 1;
+                    }
+                    if (fast && score_check) {
+                        gdn_now.resize(trunk.gdn.size());
+                        if (!gdn_now.empty() &&
+                            (cudaMemcpy(gdn_now.data(), ss.gdn_state, gdn_now.size(), cudaMemcpyDeviceToHost) != cudaSuccess ||
+                             std::memcmp(gdn_now.data(), trunk.gdn.data(), gdn_now.size()) != 0)) {
+                            std::printf("ERR decision fast path: the recurrent state changed\n");
+                            return 1;
+                        }
+                    }
+                    if (!(fast ? checkpoint_restore_running(trunk, ss, g) : checkpoint_restore(trunk, ss, g))) {
                         std::printf("ERR score: restoring the trunk failed%s%s\n", ckpt_why.c_str(), err.c_str());
                         return 1;
                     }
