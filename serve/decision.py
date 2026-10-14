@@ -19,7 +19,6 @@ import json
 import math
 import os
 import threading
-import time
 
 MAX_FIELDS, MAX_VALUES, MAX_CONTEXTS = 32, 255, 64
 MAX_NAME, MAX_VALUE, MAX_TEXT, MAX_SYSTEM = 64, 256, 16384, 262144   # bytes; the instructions + catalogue, in chars
@@ -332,15 +331,12 @@ def run(svc, job: dict) -> dict:
     for ids in job["prompts"]:
         if limit and len(ids) + longest > limit:
             raise ValueError(f"a context and the schema need {len(ids) + longest} tokens; the context window is {limit}")
-    t0 = time.perf_counter()
-    results, prefill_ms, scoring_ms, rounds, rows, cached = [], 0.0, 0.0, 0, 0, 0
+    results = []
     cancel = threading.Event()  # a client that hangs up does not stop its decision; chat watches the socket, this path does not yet
-    prompt_tokens = 0
     for ids in job["prompts"]:
-        prompt_tokens += len(ids)
         walks = [None if p.tree else _Walk(p.paths) for p in plans]
         probs: list = [None] * len(plans)
-        ctx_rows, first = 0, True
+        first = True
         while True:
             todo, owner = [], []
             for f, p in enumerate(plans):
@@ -355,16 +351,7 @@ def run(svc, job: dict) -> dict:
                         todo.append((p.suffix + walks[f].chosen, opts))
                         owner.append(f)
             if todo:
-                scored, done = engine.score(ids, todo, cancel, pin=0)
-                rounds += 1
-                ctx_rows += sum(len(t) for t, _ in todo)
-                try:   # DONE <gen> <prompt tokens> <prompt ms> <decode ms> <finish> <drafts ok> <drafts> <reused> ...
-                    fields_ = done.split()
-                    prefill_ms += float(fields_[3])
-                    scoring_ms += float(fields_[4])
-                    cached += int(fields_[8])
-                except (IndexError, ValueError):
-                    pass
+                scored, _ = engine.score(ids, todo, cancel, pin=0)
             node_scores = [[] for _ in plans]
             for f, (_, opts), r in zip(owner, todo, scored if todo else []):
                 if r is None:
@@ -382,51 +369,28 @@ def run(svc, job: dict) -> dict:
             first = False
             if not todo:
                 break
-        results.append((ids, probs, walks, ctx_rows))
-        rows += ctx_rows
-    total_ms = (time.perf_counter() - t0) * 1000.0
-    out = [_assemble(plans, probs, walks) | {"usage": {"context_tokens": len(ids), "scored_rows": r}}
-           for ids, probs, walks, r in results]
-    return {"object": "decision", "model": svc.model, "created": int(time.time()), "results": out,
-            "usage": {"prompt_tokens": prompt_tokens, "cached_tokens": cached,
-                      "context_tokens": prompt_tokens, "scored_rows": rows},
-            "timings": {"prefill_ms": round(prefill_ms, 1), "scoring_ms": round(scoring_ms, 1),
-                        "total_ms": round(total_ms, 1), "rounds": rounds,
-                        "per_decision_ms": round(total_ms / len(results), 1)}}
+        results.append(_assemble(plans, probs, walks))
+    return {"results": results}
 
 
 def _assemble(plans, probs, walks) -> dict:
-    """mode = argmax; median = where the CDF crosses 0.5; mean = the grid value nearest the expectation; numeric tree
-    fields also get the p10-p90 interval.  Greedy fields have no distribution: median/mean give the greedy winner."""
-    decision, fields = {}, {}
+    """One answer per field: {value, probability}.  mode = argmax; median = where the CDF crosses 0.5; mean = the grid
+    value nearest the expectation.  Greedy fields have no distribution: the greedy winner and its path's probability."""
+    out = {}
     for f, p in enumerate(plans):
         sp, pr, w = p.spec, probs[f], walks[f]
         idx = max(range(len(pr)), key=pr.__getitem__) if pr else w.winner
-        entry = {}
-        if sp.numbers and pr:
-            order = sorted(range(len(sp.numbers)), key=sp.numbers.__getitem__)
-
-            def quantile(q):
-                acc = 0.0
-                for k in order:
-                    acc += pr[k]
-                    if acc >= q:
-                        return k
-                return order[-1]
-            if sp.aggregate == "median":
-                idx = quantile(0.5)
-            elif sp.aggregate == "mean":
-                mean = sum(n * q for n, q in zip(sp.numbers, pr))
-                idx = 0
-                for k in range(1, len(sp.numbers)):
-                    if abs(sp.numbers[k] - mean) < abs(sp.numbers[idx] - mean):
-                        idx = k
-            entry["interval_p10_p90"] = [sp.values[quantile(0.1)], sp.values[quantile(0.9)]]
+        if sp.numbers and pr and sp.aggregate == "median":
+            acc = 0.0
+            for k in sorted(range(len(sp.numbers)), key=sp.numbers.__getitem__):
+                acc += pr[k]
+                idx = k
+                if acc >= 0.5:
+                    break
+        elif sp.numbers and pr and sp.aggregate == "mean":
+            mean = sum(n * q for n, q in zip(sp.numbers, pr))
+            idx = min(range(len(sp.numbers)), key=lambda k: abs(sp.numbers[k] - mean))
         if not 0 <= idx < len(sp.values):
             raise ValueError(f'field "{sp.name}" has no selected value')
-        decision[sp.name] = sp.values[idx]
-        fields[sp.name] = {"value": sp.values[idx], "probability": pr[idx] if pr else w.score,
-                           "scored_nodes": len(p.nodes) if p.tree else w.scored, "tree": p.tree, **entry}
-        if pr:
-            fields[sp.name]["options"] = [{"value": v, "probability": q} for v, q in zip(sp.values, pr)]
-    return {"decision": decision, "fields": fields}
+        out[sp.name] = {"value": sp.values[idx], "probability": pr[idx] if pr else w.score}
+    return out
