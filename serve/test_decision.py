@@ -232,8 +232,8 @@ class Api(unittest.TestCase):
             self.assertEqual(code, 400, body if len(str(body)) < 200 else list(body))
             self.assertEqual(out["error"]["type"], "invalid_request_error")
         self.assertFalse(hasattr(self.engine, "scored"))
-        code, out = self.decide(model="nope")
-        self.assertEqual(code, 404)
+        code, out = self.decide(model="another-name")          # served like chat: any model name answers
+        self.assertEqual(code, 200, out)
 
     def test_a_parallel_slot_engine_is_refused(self):
         self.engine.batch = 2
