@@ -5357,9 +5357,7 @@ def make_handler(svc: Service):
                 elif path == "/v1/messages/count_tokens":
                     self._count_tokens(req)
                 elif path == "/v1/decision":                 # serve/decision.py: a schema answered by scoring
-                    if req.get("model") not in (None, *svc.model_names()):
-                        self._json(404, {"error": {"message": "model not found"}})
-                        return
+                    # any model name is served, as for chat: a router in front names the model by its own name
                     job = decision_api.prepare(svc, req)     # a bad request never waits for the engine's turn
                     if not svc.fifo.acquire(timeout=600):
                         raise ModelBusy("a request is running or queued")
