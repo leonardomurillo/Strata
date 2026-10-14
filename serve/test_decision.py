@@ -131,24 +131,24 @@ class Aggregates(unittest.TestCase):
         svc, _ = rig(lambda tok: Table(tok, digits(self.PROBS)))
         job = decision.prepare(svc, {"schema": {"n": field(type="integer", minimum=1, maximum=5, **spec)},
                                      "contexts": ["c"]})
-        return decision.run(svc, job)["results"][0]["fields"]["n"]
+        return decision.run(svc, job)["results"][0]["n"]
 
     def test_mode_median_and_mean_read_the_same_distribution(self):
         mode = self.ask()
-        self.assertEqual(mode["value"], 1)
+        self.assertEqual(mode, {"value": 1, "probability": mode["probability"]})
         self.assertAlmostEqual(mode["probability"], 0.4, places=6)
-        self.assertEqual(self.ask(aggregate="median")["value"], 2)           # the CDF crosses 0.5 at 2
+        median = self.ask(aggregate="median")
+        self.assertEqual(median["value"], 2)                                 # the CDF crosses 0.5 at 2
+        self.assertAlmostEqual(median["probability"], 0.15, places=6)        # the chosen value's own probability
         self.assertEqual(self.ask(aggregate="mean")["value"], 3)             # expectation 2.7
-        self.assertEqual(mode["interval_p10_p90"], [1, 5])
-        self.assertEqual((mode["tree"], mode["scored_nodes"]), (True, 1))
 
     def test_greedy_has_no_distribution_so_every_aggregate_is_the_winner(self):
         svc, _ = rig(lambda tok: Table(tok, digits(self.PROBS)))
         job = decision.prepare(svc, {"schema": {"n": field(type="integer", minimum=1, maximum=5, aggregate="mean")},
                                      "contexts": ["c"], "mode": "greedy"})
-        f = decision.run(svc, job)["results"][0]["fields"]["n"]
-        self.assertEqual((f["value"], f["tree"]), (1, False))
-        self.assertNotIn("interval_p10_p90", f)
+        f = decision.run(svc, job)["results"][0]["n"]
+        self.assertEqual(set(f), {"value", "probability"})
+        self.assertEqual(f["value"], 1)
         self.assertAlmostEqual(f["probability"], 0.4, places=6)
 
 
@@ -178,19 +178,13 @@ class Api(unittest.TestCase):
     def test_the_answer_has_the_contract_shape(self):
         code, out = self.decide(contexts=["a", "b"], instructions="Be brief.")
         self.assertEqual(code, 200, out)
-        self.assertEqual(out["object"], "decision")
-        self.assertEqual(len(out["results"]), 2)
-        r = out["results"][0]
-        self.assertEqual(set(r), {"decision", "fields", "usage"})
-        self.assertEqual(set(r["decision"]), set(SCHEMA))
-        self.assertEqual(set(r["fields"]["score"]), {"value", "probability", "scored_nodes", "tree",
-                                                     "interval_p10_p90", "options"})
-        self.assertNotIn("interval_p10_p90", r["fields"]["category"])
-        self.assertEqual(set(r["usage"]), {"context_tokens", "scored_rows"})
-        self.assertEqual(set(out["usage"]), {"prompt_tokens", "cached_tokens", "context_tokens", "scored_rows"})
-        self.assertEqual(set(out["timings"]), {"prefill_ms", "scoring_ms", "total_ms", "rounds", "per_decision_ms"})
-        self.assertEqual(out["timings"]["rounds"], 2)                        # one tree round per context
-        self.assertEqual(out["model"], self.svc.model)
+        self.assertEqual(set(out), {"results"})                             # only the answers
+        self.assertEqual(len(out["results"]), 2)                            # one per context
+        for r in out["results"]:
+            self.assertEqual(set(r), set(SCHEMA))
+            for f in r.values():
+                self.assertEqual(set(f), {"value", "probability"})
+                self.assertTrue(0.0 <= f["probability"] <= 1.0)
 
     def test_each_fields_probabilities_sum_to_one_and_the_value_is_the_argmax(self):
         job = decision.prepare(self.svc, {"schema": SCHEMA, "contexts": ["x"]})
@@ -205,7 +199,7 @@ class Api(unittest.TestCase):
             probs = decision.finish_tree(p.paths, p.nodes, node_scores) if p.nodes else [1.0]
             self.assertAlmostEqual(sum(probs), 1.0, places=4)
             scored[p.spec.name] = (p, probs)
-        fields = decision.run(self.svc, job)["results"][0]["fields"]
+        fields = decision.run(self.svc, job)["results"][0]
         for name, (p, probs) in scored.items():
             if p.spec.aggregate == "mode":
                 self.assertEqual(fields[name]["value"], p.spec.values[probs.index(max(probs))])
@@ -215,7 +209,7 @@ class Api(unittest.TestCase):
         _, a = self.decide(mode="tree")
         _, b = self.decide(mode="tree", schema=dict(reversed(list(SCHEMA.items()))))
         for name in SCHEMA:
-            fa, fb = a["results"][0]["fields"][name], b["results"][0]["fields"][name]
+            fa, fb = a["results"][0][name], b["results"][0][name]
             self.assertAlmostEqual(fa["probability"], fb["probability"], places=3)
             self.assertEqual(fa["value"], fb["value"])
 
@@ -294,23 +288,19 @@ class Plain(unittest.TestCase):
         self.assertGreater(special(tok.encode(every, parse_special=True)), 0)
 
 
-class Options(unittest.TestCase):
-    def test_tree_fields_list_every_option_in_the_callers_order_and_greedy_fields_do_not(self):
+class Answers(unittest.TestCase):
+    def test_each_question_is_one_value_and_its_probability_in_tree_and_greedy_mode(self):
         svc, _ = rig()
-        job = decision.prepare(svc, {"schema": SCHEMA, "contexts": ["x"]})
-        fields = decision.run(svc, job)["results"][0]["fields"]
-        for name, spec in SCHEMA.items():
-            f = fields[name]
-            self.assertEqual([o["value"] for o in f["options"]],
-                             [s for s in decision.compile_schema(SCHEMA) if s.name == name][0].values)
-            self.assertAlmostEqual(sum(o["probability"] for o in f["options"]), 1.0, places=4)
-            if "aggregate" not in spec:
-                best = max(f["options"], key=lambda o: o["probability"])
-                self.assertEqual(f["value"], best["value"])
-        self.assertEqual([o["value"] for o in fields["category"]["options"]], ["billing", "technical", "other"])
-        self.assertEqual([o["value"] for o in fields["urgent"]["options"]], [True, False])
-        greedy = decision.run(svc, decision.prepare(svc, {"schema": SCHEMA, "contexts": ["x"], "mode": "greedy"}))
-        self.assertTrue(all("options" not in f for f in greedy["results"][0]["fields"].values()))
+        values = {s.name: s.values for s in decision.compile_schema(SCHEMA)}
+        for mode in ("tree", "greedy"):
+            out = decision.run(svc, decision.prepare(svc, {"schema": SCHEMA, "contexts": ["x"], "mode": mode}))
+            self.assertEqual(set(out), {"results"})
+            r = out["results"][0]
+            self.assertEqual(list(r), list(SCHEMA))                          # the caller's order
+            for name, f in r.items():
+                self.assertEqual(set(f), {"value", "probability"}, (mode, name))
+                self.assertIn(f["value"], values[name])                     # the caller's value, never a label
+                self.assertTrue(0.0 <= f["probability"] <= 1.0)
 
     def test_the_catalogue_shows_each_label_next_to_its_option(self):
         svc, _ = rig()
@@ -328,24 +318,23 @@ class Labels(unittest.TestCase):
     def ask(self, schema, table, **kw):
         svc, _ = rig(lambda tok: Table(tok, table))
         job = decision.prepare(svc, {"schema": schema, "contexts": ["x"], **kw})
-        return svc, job, decision.run(svc, job)["results"][0]["fields"]
+        return svc, job, decision.run(svc, job)["results"][0]
 
     def test_digits_are_scored_but_the_caller_sees_its_own_values(self):
         table = {48: math.log(0.1), 49: math.log(0.7), 50: math.log(0.2)}
         svc, job, f = self.ask(self.ENUM, table)
         self.assertEqual(f["c"]["value"], "technical")
-        self.assertEqual([o["value"] for o in f["c"]["options"]], ["billing", "technical", "other"])
-        for o, want in zip(f["c"]["options"], [0.1, 0.7, 0.2]):
-            self.assertAlmostEqual(o["probability"], want, places=4)
+        self.assertAlmostEqual(f["c"]["probability"], 0.7, places=4)
         self.assertEqual(job["plans"][0].paths[1][0], ord("1"))                   # the scored token is the label
 
     def test_a_boolean_is_true_then_false_and_integers_keep_their_numerals(self):
         schema = {"b": field(type="boolean"), "n": field(type="integer", minimum=1, maximum=3)}
         table = {48: math.log(0.2), 49: math.log(0.8), 50: math.log(0.1), 51: math.log(0.1), 52: math.log(0.1)}
         svc, job, f = self.ask(schema, table)
-        self.assertIs(f["b"]["value"], False)
-        self.assertEqual([o["value"] for o in f["b"]["options"]], [True, False])
-        self.assertEqual([o["value"] for o in f["n"]["options"]], [1, 2, 3])
+        self.assertIs(f["b"]["value"], False)                                # label 1 = false, p 0.8
+        self.assertAlmostEqual(f["b"]["probability"], 0.8, places=4)
+        self.assertEqual(f["n"]["value"], 1)                                 # numeral 1 scored as itself
+        self.assertAlmostEqual(f["n"]["probability"], 0.8, places=4)
 
     def test_eleven_to_twenty_six_options_are_lettered(self):
         choices = [f"v{i}" for i in range(12)]
@@ -354,8 +343,7 @@ class Labels(unittest.TestCase):
         table = {ord("a") + k: math.log(p) for k, p in enumerate(probs)}
         svc, job, f = self.ask({"e": field("pick", type="enum", choices=choices)}, table)
         self.assertEqual(f["e"]["value"], "v4")
-        self.assertEqual([o["value"] for o in f["e"]["options"]], choices)
-        self.assertAlmostEqual(f["e"]["options"][4]["probability"], 0.78, places=4)
+        self.assertAlmostEqual(f["e"]["probability"], 0.78, places=4)
         self.assertEqual([p[0] for p in job["plans"][0].paths], [ord("a") + k for k in range(12)])
         text = bytes(t for t in job["prompts"][0] if t < 256).decode("utf-8", "replace")
         self.assertIn('Allowed values: a = "v0", b = "v1", c = "v2"', text)
