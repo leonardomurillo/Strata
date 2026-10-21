@@ -1,0 +1,167 @@
+name: build-windows-cuda
+
+# Windows x64 build of the CUDA engine (strata.exe) and a CPU-only image encoder (strata-vision.exe), packed
+# with BUILD.json as strata-windows-x64.zip + SHA256SUMS (the same three-entry layout as the upstream release
+# zip). The build job is read-only and has no secrets; publishing is a separate workflow (publish.yml).
+#
+# Inputs are pinned: the CUDA 13.0.1 redistributable archives by SHA-256 (NVIDIA's redistrib_13.0.1.json),
+# ggml's llama.cpp checkout by full commit SHA, and every action by full commit SHA.
+# CUDA 13.0.1 = nvcc 13.0.88 + cuBLAS 13.0.2.14, the cuBLAS the runtime wheel nvidia-cublas==13.0.2.14 ships.
+# CUDA 13.0-13.2 accept Visual Studio 2019/2022 only, hence windows-2022.
+
+on:
+  push:
+    tags: ['v*-lp*']
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'version written to BUILD.json (e.g. 0.1.43-lp1); default: the tag name without the leading v'
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-windows-cuda-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CUDA_REDIST: https://developer.download.nvidia.com/compute/cuda/redist
+  NVCC_VERSION: '13.0.88'
+  CUBLAS_VERSION: '13.0.2.14'
+  LLAMA_CPP_COMMIT: 3cf03257f219afbe7334045ff7c6a06ac68c627d
+  CUDA_ARCHS: '75;86;89;120'
+
+jobs:
+  build:
+    runs-on: windows-2022
+    timeout-minutes: 350
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Version
+        shell: pwsh
+        env:
+          IN_VERSION: ${{ inputs.version }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          $v = if ($env:IN_VERSION) { $env:IN_VERSION } else { $env:REF_NAME -replace '^v', '' }
+          if ($v -notmatch '^[0-9A-Za-z][0-9A-Za-z._-]{0,63}$') { throw "bad version '$v'" }
+          "BUILD_VERSION=$v" >> $env:GITHUB_ENV
+
+      - name: Install CUDA 13.0.1 (SHA-256 pinned redistributable archives)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $ProgressPreference = 'SilentlyContinue'
+          $root = Join-Path $env:RUNNER_TEMP 'cuda'
+          New-Item -ItemType Directory -Force $root | Out-Null
+          $parts = @(
+            @('cuda_nvcc/windows-x86_64/cuda_nvcc-windows-x86_64-13.0.88-archive.zip', '61760e24a44937c6c29a20ddea69067b4d3860ccd6a9a0564573f840d96e6c5f'),
+            @('cuda_crt/windows-x86_64/cuda_crt-windows-x86_64-13.0.88-archive.zip', 'ff413c89dbd96ed3b3dcfac923437de78acea32fb90309277197c8a127588112'),
+            @('libnvvm/windows-x86_64/libnvvm-windows-x86_64-13.0.88-archive.zip', '6dda4a82d22a2c173a65c66b4b4c933e3424a56ce845e2864bdca9cc66e6c524'),
+            @('cuda_cudart/windows-x86_64/cuda_cudart-windows-x86_64-13.0.88-archive.zip', '48b1a445cbc2b2b468f872bc698a751d763ef5c06bc03ce559af1bc7e23f9345'),
+            @('libcublas/windows-x86_64/libcublas-windows-x86_64-13.0.2.14-archive.zip', 'b03fd06fb14fa33e27fc441433fe74ccee9738b62c62a08d39960cb0ce9f1d14'),
+            @('cuda_cccl/windows-x86_64/cuda_cccl-windows-x86_64-13.0.85-archive.zip', 'f4f5187f7976d8057d76e1e04e72c8b7d0a2a22793107a671ad709b1d8d3408d'),
+            @('cuda_nvtx/windows-x86_64/cuda_nvtx-windows-x86_64-13.0.85-archive.zip', '184f578d7bcce2012edf266c51dfa7834ded41464f62459f4ebcb2398cddc665'),
+            @('cuda_profiler_api/windows-x86_64/cuda_profiler_api-windows-x86_64-13.0.85-archive.zip', '38c6c854f325b64e7ca0a8b14e1996dedb5abbb38f3580e5c7744b688abdc56e')
+          )
+          foreach ($p in $parts) {
+            $zip = Join-Path $env:RUNNER_TEMP (Split-Path $p[0] -Leaf)
+            Invoke-WebRequest -Uri "$env:CUDA_REDIST/$($p[0])" -OutFile $zip
+            $h = (Get-FileHash -LiteralPath $zip -Algorithm SHA256).Hash.ToLower()
+            if ($h -ne $p[1]) { throw "SHA-256 mismatch for $($p[0]): got $h" }
+            $x = Join-Path $env:RUNNER_TEMP 'cuda-x'
+            if (Test-Path $x) { Remove-Item -Recurse -Force $x }
+            Expand-Archive -LiteralPath $zip -DestinationPath $x
+            $top = @(Get-ChildItem -LiteralPath $x -Directory)
+            if ($top.Count -ne 1) { throw "unexpected layout in $($p[0])" }
+            Copy-Item -Recurse -Force (Join-Path $top[0].FullName '*') $root
+            Remove-Item -Force $zip
+          }
+          "CUDA_PATH=$root" >> $env:GITHUB_ENV
+          (Join-Path $root 'bin') >> $env:GITHUB_PATH
+
+      - name: Check toolkit versions
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $v = (& (Join-Path $env:CUDA_PATH 'bin\nvcc.exe') --version) -join "`n"
+          if ($v -notmatch [regex]::Escape("V$env:NVCC_VERSION")) { throw "nvcc is not $($env:NVCC_VERSION):`n$v" }
+          $hdr = Get-Content -Raw -LiteralPath (Join-Path $env:CUDA_PATH 'include\cublas_api.h')
+          $n = foreach ($k in 'MAJOR', 'MINOR', 'PATCH', 'BUILD') {
+            if ($hdr -notmatch "#define\s+CUBLAS_VER_$k\s+(\d+)") { throw "CUBLAS_VER_$k not found" }
+            $Matches[1]
+          }
+          $cb = $n -join '.'
+          if ($cb -ne $env:CUBLAS_VERSION) { throw "cuBLAS headers are $cb, expected $($env:CUBLAS_VERSION)" }
+          "nvcc $($env:NVCC_VERSION), cuBLAS $cb"
+
+      - name: Fetch ggml (llama.cpp at the pinned commit)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $d = Join-Path $env:RUNNER_TEMP 'llama.cpp'
+          git init -q $d
+          git -C $d fetch -q --depth 1 https://github.com/ggml-org/llama.cpp.git $env:LLAMA_CPP_COMMIT
+          git -C $d -c advice.detachedHead=false checkout -q FETCH_HEAD
+          $head = (git -C $d rev-parse HEAD).Trim()
+          if ($head -ne $env:LLAMA_CPP_COMMIT) { throw "llama.cpp checkout is $head" }
+          "LLAMA_DIR=$d" >> $env:GITHUB_ENV
+
+      - name: Build the engine
+        shell: cmd
+        run: |
+          call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvarsall.bat" x64 || exit /b 1
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release ^
+            -DSTRATA_ENABLE_CUDA=ON -DSTRATA_BUILD_TESTS=OFF -DSTRATA_PORTABLE=ON ^
+            "-DCMAKE_CUDA_ARCHITECTURES=%CUDA_ARCHS%" "-DCMAKE_CUDA_COMPILER=%CUDA_PATH%\bin\nvcc.exe" ^
+            "-DCUDAToolkit_ROOT=%CUDA_PATH%" "-DSTRATA_GGML_DIR=%LLAMA_DIR%" || exit /b 1
+          rem CUDA 13.0's ptxas now and then fails to parse a PTX file it just wrote; a second run gets past it
+          cmake --build build --target strata -j 4 || cmake --build build --target strata -j 4 || exit /b 1
+
+      - name: Build the image encoder (CPU)
+        shell: cmd
+        run: |
+          call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvarsall.bat" x64 || exit /b 1
+          cmake -S tools/vision -B build-vision -G Ninja -DCMAKE_BUILD_TYPE=Release ^
+            "-DLLAMA_DIR=%LLAMA_DIR%" -DSTRATA_VISION_CUDA=OFF -DSTRATA_PORTABLE=ON || exit /b 1
+          cmake --build build-vision --target strata-vision -j 4 || exit /b 1
+
+      - name: Pack
+        shell: pwsh
+        env:
+          COMMIT: ${{ github.sha }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $out = Join-Path $env:RUNNER_TEMP 'pkg'
+          New-Item -ItemType Directory -Force $out | Out-Null
+          Copy-Item -LiteralPath 'build\strata.exe' (Join-Path $out 'strata.exe')
+          Copy-Item -LiteralPath 'build-vision\bin\strata-vision.exe' (Join-Path $out 'strata-vision.exe')
+          if (Test-Path 'build\strata_kq.dll') { Copy-Item -LiteralPath 'build\strata_kq.dll' (Join-Path $out 'strata_kq.dll') }
+          $archs = @($env:CUDA_ARCHS -split ';' | ForEach-Object { [int]$_ })
+          $meta = [ordered]@{
+            version = $env:BUILD_VERSION; source = 'fork'; commit = $env:COMMIT
+            archs = $archs; ptx = $true; cuda = '13.0.1'; nvcc = $env:NVCC_VERSION; cublas = $env:CUBLAS_VERSION
+            vision = 'cpu'; portable = $true
+          }
+          $utf8 = New-Object System.Text.UTF8Encoding($false)
+          [IO.File]::WriteAllText((Join-Path $out 'BUILD.json'), ($meta | ConvertTo-Json -Depth 3), $utf8)
+          $zip = Join-Path $env:GITHUB_WORKSPACE 'strata-windows-x64.zip'
+          Compress-Archive -Path (Join-Path $out '*') -DestinationPath $zip
+          $h = (Get-FileHash -LiteralPath $zip -Algorithm SHA256).Hash.ToLower()
+          [IO.File]::WriteAllText((Join-Path $env:GITHUB_WORKSPACE 'SHA256SUMS'), "$h  strata-windows-x64.zip`n", $utf8)
+          Get-Content (Join-Path $out 'BUILD.json')
+          "sha256 $h"
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: strata-windows-x64
+          path: |
+            strata-windows-x64.zip
+            SHA256SUMS
+          if-no-files-found: error
+          retention-days: 14
