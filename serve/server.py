@@ -297,10 +297,15 @@ class MockEngine:
                 time.sleep(self.delay)
             yield t
 
-    def score(self, ids, branches, cancel, pin=0, timeout_s=600.0):
+    def score(self, ids, branches, cancel, pin=0, timeout_s=600.0, readout=False):
         """decisions without a GPU: a candidate's log-probability depends on its branch's tokens and its id only (never
-        on the prompt or another branch), so fields stay independent.  -> (per branch {candidate: logprob}, DONE)."""
+        on the prompt or another branch), so fields stay independent.  -> (per branch {candidate: logprob}, DONE).
+        `readout`: the engine's contract - one branch without tokens on a one-shot request - or a refusal."""
+        if readout and (pin or len(branches) != 1 or list(branches[0][0])):
+            raise ValueError("readout: needs ckpt=0, exactly one branch and no branch tokens")
         self.scored = [list(b) for b in branches]
+        self.scored_ids = list(ids)
+        self.readouts = getattr(self, "readouts", 0) + int(bool(readout))
         return [{c: -((sum(toks) * 31 + c * 17) % 53) / 8.0 for c in cands} for toks, cands in branches],             "DONE 0 %d 1.0 2.0 score 0 0 0" % len(ids)
 
 
@@ -1684,19 +1689,23 @@ class StrataEngine:
                          "tok_s": round(r["generated"] / max(1e-6, now - ft), 1) if ft else None})
         return view
 
-    def score(self, ids, branches, cancel, pin=0, timeout_s=600.0):
+    def score(self, ids, branches, cancel, pin=0, timeout_s=600.0, readout=False):
         """Decision branches (serve/decision.py): one GEN request whose `score=` key carries every branch's tokens
         (they follow the prompt's last token) and its candidate ids.  The engine reads the prompt, scores every branch
         from the same state and decodes nothing.  -> ([{candidate id: logprob} or None (a non-finite row) per branch],
         the DONE line).  `pin`: the first N prompt tokens are a shared prefix kept for the next decision (needs the
-        request checkpointed; without it the request is one-shot, ckpt=0)."""
+        request checkpointed; without it the request is one-shot, ckpt=0).  `readout`: `readout=1` - the one branch
+        has no tokens, the engine answers the prompt's last row and keeps no trunk (ckpt=0 only; an engine without
+        the key answers `ERR score: readout...`, a ValueError the caller remembers)."""
         if not self.alive():
             raise EngineDied("the engine is unavailable; this request was not sent")
         if getattr(self, "batch", 0):
             raise ValueError("decisions need an engine without parallel slots")
+        if readout and (pin or len(branches) != 1 or list(branches[0][0])):
+            raise ValueError("readout: needs ckpt=0, exactly one branch and no branch tokens")
         spec = ";".join(",".join(str(int(t)) for t in toks) + ":" + ",".join(str(int(c)) for c in cands)
                         for toks, cands in branches)
-        keys = (f" pin={int(pin)}" if pin else " ckpt=0") + f" score={spec}"
+        keys = (f" pin={int(pin)}" if pin else " ckpt=0") + (" readout=1" if readout else "") + f" score={spec}"
         try:
             self.proc.stdin.write(f"GEN 1{keys} {','.join(str(int(t)) for t in ids)}\n")
             self.proc.stdin.flush()
@@ -5439,6 +5448,7 @@ def make_handler(svc: Service):
                      "model_alias": svc.model, "chat_template": svc.template.source,
                      "chat_template_caps": svc.template.caps,
                      "decision": True,                                  # POST /v1/decision (serve/decision.py)
+                     "decision_calibration": decision_api.calibration.entries(),   # fitted fields (serve/calibration.py)
                      "modalities": {"vision": svc.vision is not None}, "models_autoload": hasattr(svc.engine, "restart"),
                      "is_sleeping": not svc.loaded()}
             if getattr(svc.engine, "model_path", None):

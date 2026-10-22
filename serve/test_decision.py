@@ -12,7 +12,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
-from serve import decision  # noqa: E402
+from serve import calibration, decision  # noqa: E402
 from serve.frontend import ChatTemplate  # noqa: E402
 from serve.server import ByteTokenizer, EngineDied, MockEngine, Service, serve  # noqa: E402
 
@@ -35,7 +35,9 @@ class Table(MockEngine):
         super().__init__(tok, "ok", max_context=16384)
         self.table = table
 
-    def score(self, ids, branches, cancel, pin=0, timeout_s=600.0):
+    def score(self, ids, branches, cancel, pin=0, timeout_s=600.0, readout=False):
+        self.scored_ids, self.scored = list(ids), [list(b) for b in branches]
+        self.readouts = getattr(self, "readouts", 0) + int(bool(readout))
         return [{c: self.table[c] for c in cands} for _, cands in branches], "DONE 0 1 1.0 2.0 score 0 0 0"
 
 
@@ -44,10 +46,24 @@ class Flaky(MockEngine):
         super().__init__(tok, "Fine.", max_context=16384)
         self.fail = True
 
-    def score(self, ids, branches, cancel, pin=0, timeout_s=600.0):
+    def score(self, ids, branches, cancel, pin=0, timeout_s=600.0, readout=False):
         if self.fail:
             self.fail = False
             raise EngineDied("the engine stopped unexpectedly (exit code 1)")
+        return super().score(ids, branches, cancel, pin, readout=readout)
+
+
+class Stale(MockEngine):
+    """An engine from before the readout key: it answers `ERR score: readout...` (a ValueError at the caller)."""
+
+    def __init__(self, tok):
+        super().__init__(tok, "Fine.", max_context=16384)
+        self.refusals = 0
+
+    def score(self, ids, branches, cancel, pin=0, timeout_s=600.0, readout=False):
+        if readout:
+            self.refusals += 1
+            raise ValueError("readout: unknown key")
         return super().score(ids, branches, cancel, pin)
 
 
@@ -387,6 +403,106 @@ class Labels(unittest.TestCase):
             decision.prepare(svc, body)
         svc.engine.score_rows = 8
         self.assertEqual(decision.prepare(svc, body)["windows"], 192)
+
+
+class Readout(unittest.TestCase):
+    """One labelled field = one row: the suffix joins the prompt, the engine reads that row without a trunk."""
+    ONE = {"urgent": field("urgent?", type="boolean")}
+
+    def tearDown(self):
+        calibration.reset()
+
+    def test_one_labelled_field_is_a_readout_and_the_token_sequence_is_the_branch_path_one(self):
+        svc, _ = rig()
+        for schema in (self.ONE, {"c": field("kind", type="enum", choices=[f"v{i}" for i in range(10)])},
+                       {"e": field("pick", type="enum", choices=[f"v{i}" for i in range(26)])}):
+            job = decision.prepare(svc, {"schema": schema, "contexts": ["a", "b"]})
+            self.assertTrue(job["readout"], schema)
+            plan = job["plans"][0]
+            out = decision.run(svc, job)
+            self.assertEqual(svc.engine.readouts, 2)                                     # one per context
+            self.assertEqual(svc.engine.scored, [[[], plan.nodes[0][1]]])                 # one empty branch
+            self.assertEqual(svc.engine.scored_ids, job["prompts"][1] + plan.suffix)      # ids(prompt) + suffix ids
+            self.assertEqual(sum(1 for t in plan.suffix if t >= 256), 0)                 # the suffix stays plain
+            for r in out["results"]:
+                self.assertEqual(set(r[next(iter(schema))]), {"value", "probability"})
+            svc.engine.readouts = 0
+
+    def test_every_other_request_takes_the_branch_path(self):
+        svc, _ = rig()
+        for body in ({"schema": SCHEMA}, {"schema": self.ONE, "mode": "greedy"},
+                     {"schema": {"n": field(type="integer", minimum=1, maximum=30)}},     # two divergence depths
+                     {"schema": {"r": field(type="number", minimum=0, maximum=1, step=0.5)}},
+                     {"schema": {**self.ONE, "x": field("x", type="boolean")}}):
+            job = decision.prepare(svc, {"contexts": ["c"], **body})
+            self.assertFalse(job["readout"], body)
+            decision.run(svc, job)
+            self.assertEqual(getattr(svc.engine, "readouts", 0), 0, body)
+            self.assertTrue(all(b[0] for b in svc.engine.scored), body)                   # branches carry tokens
+
+    def test_the_readout_distribution_is_the_root_nodes_softmax(self):
+        table = {48: math.log(0.2), 49: math.log(0.8)}
+        svc, _ = rig(lambda tok: Table(tok, table))
+        job = decision.prepare(svc, {"schema": self.ONE, "contexts": ["c"]})
+        f = decision.run(svc, job)["results"][0]["urgent"]
+        self.assertIs(f["value"], False)                                                  # label 1 = false, p 0.8
+        self.assertAlmostEqual(f["probability"], 0.8, places=6)
+        self.assertEqual(svc.engine.readouts, 1)
+
+    def test_a_refusing_engine_is_remembered_and_the_request_still_answers(self):
+        svc, _ = rig(Stale)
+        job = decision.prepare(svc, {"schema": self.ONE, "contexts": ["a", "b"]})
+        out = decision.run(svc, job)
+        self.assertEqual(len(out["results"]), 2)
+        self.assertEqual(svc.engine.refusals, 1)                                          # asked once, never again
+        self.assertTrue(svc.engine.readout_refused)
+        decision.run(svc, decision.prepare(svc, {"schema": self.ONE, "contexts": ["c"]}))
+        self.assertEqual(svc.engine.refusals, 1)
+        self.assertTrue(all(b[0] for b in svc.engine.scored))                             # the branch path answered
+
+    def test_a_chat_after_a_readout_reads_the_same(self):
+        svc, _ = rig()
+        httpd = serve(svc, port=0)
+        try:
+            base = f"http://127.0.0.1:{httpd.server_address[1]}"
+            def call(path, body):
+                req = urllib.request.Request(base + path, json.dumps(body).encode(), {"Content-Type": "application/json"})
+                with urllib.request.urlopen(req, timeout=30) as r:
+                    return json.loads(r.read())
+            chat = {"model": "m", "messages": [{"role": "user", "content": "hi"}], "temperature": 0, "max_tokens": 50}
+            before = call("/v1/chat/completions", chat)
+            call("/v1/decision", {"schema": self.ONE, "contexts": ["c"]})
+            self.assertEqual(svc.engine.readouts, 1)
+            after = call("/v1/chat/completions", chat)
+            self.assertEqual(before["choices"][0]["message"], after["choices"][0]["message"])
+            props = json.loads(urllib.request.urlopen(base + "/props", timeout=30).read())
+            self.assertEqual(props["decision_calibration"], calibration.entries())
+        finally:
+            httpd.shutdown()
+            httpd.server_close()
+
+    def test_a_fitted_entry_reshapes_the_probability_but_never_the_value(self):
+        table = {48: math.log(0.3), 49: math.log(0.7)}
+        svc, _ = rig(lambda tok: Table(tok, table))
+        specs = decision.compile_schema(self.ONE)
+        k = calibration.key(specs, "Be brief.")
+        body = {"schema": self.ONE, "contexts": ["c"], "instructions": "Be brief."}
+        calibration.reset({})
+        raw = decision.run(svc, decision.prepare(svc, body))["results"][0]["urgent"]
+        calibration.reset({k: {"urgent": {"platt": [2.0]}}})
+        cal = decision.run(svc, decision.prepare(svc, body))["results"][0]["urgent"]
+        self.assertEqual((raw["value"], cal["value"]), (False, False))
+        self.assertAlmostEqual(raw["probability"], 0.7, places=6)
+        self.assertGreater(cal["probability"], 0.7)                                       # a = 2: sharper
+        other = decision.run(svc, decision.prepare(svc, {**body, "instructions": "Other."}))["results"][0]["urgent"]
+        self.assertAlmostEqual(other["probability"], 0.7, places=6)                       # another prompt: identity
+        # the branch path is calibrated the same way
+        two = {**self.ONE, "x": field("x", type="boolean")}
+        k2 = calibration.key(decision.compile_schema(two), "")
+        calibration.reset({k2: {"urgent": {"platt": [2.0]}}})
+        f = decision.run(svc, decision.prepare(svc, {"schema": two, "contexts": ["c"]}))["results"][0]
+        self.assertGreater(f["urgent"]["probability"], 0.7)
+        self.assertAlmostEqual(f["x"]["probability"], 0.7, places=6)
 
 
 if __name__ == "__main__":

@@ -12,6 +12,12 @@ values back, each with its probability.  Numeric fields are scored as their own 
 
 Nothing the caller writes becomes a special token: the system text (field names, descriptions, values, instructions)
 and every context are encoded as plain-text spans, and so is each branch.
+
+Readout: a request with ONE field whose paths all diverge at their first token (every labelled enum/boolean field)
+needs no branch window at all - its distribution is the row after the field's suffix.  The suffix tokens are appended
+to the prompt's ids (the very ids the branch carried, so the sequence the model sees is unchanged) and the engine is
+asked for that row alone (`readout=1`: no trunk checkpoint saved or restored).  Any other request, and an engine that
+refuses the key (remembered per engine), takes the branch path.  Probabilities then pass through serve/calibration.py.
 """
 from __future__ import annotations
 
@@ -19,6 +25,8 @@ import json
 import math
 import os
 import threading
+
+from serve import calibration
 
 MAX_FIELDS, MAX_VALUES, MAX_CONTEXTS = 32, 255, 64
 MAX_NAME, MAX_VALUE, MAX_TEXT, MAX_SYSTEM = 64, 256, 16384, 262144   # bytes; the instructions + catalogue, in chars
@@ -255,6 +263,11 @@ class _Plan:
         self.longest = len(self.suffix) + longest       # the longest branch's tokens
         self.branches = max(1, len(self.nodes)) if self.tree else 1
 
+    @property
+    def one_row(self) -> bool:
+        """The whole distribution is one row: tree mode with a single divergence at the paths' first token."""
+        return self.tree and len(self.nodes) == 1 and self.nodes[0][0] == []
+
     def windows(self, rows: int) -> int:
         """Engine windows the field's first round costs (a branch is the prompt's last token + its tokens)."""
         if not self.tree:
@@ -317,7 +330,9 @@ def prepare(svc, req: dict) -> dict:
         text = head + system + mid + c + tail
         s0 = len(head) + len(system) + len(mid)
         prompts.append(_ids(svc.tok, text, True, [(len(head), len(head) + len(system)), (s0, s0 + len(c))]))
-    return {"plans": plans, "prompts": prompts, "mode": mode, "windows": windows}
+    return {"plans": plans, "prompts": prompts, "contexts": contexts, "mode": mode, "windows": windows,
+            "readout": len(plans) == 1 and plans[0].one_row,
+            "calibration": calibration.key(specs, instructions)}
 
 
 def run(svc, job: dict) -> dict:
@@ -333,9 +348,33 @@ def run(svc, job: dict) -> dict:
             raise ValueError(f"a context and the schema need {len(ids) + longest} tokens; the context window is {limit}")
     results = []
     cancel = threading.Event()  # a client that hangs up does not stop its decision; chat watches the socket, this path does not yet
-    for ids in job["prompts"]:
+    # readout (one field, one row): the suffix joins the prompt's ids unchanged (the branch carried these very ids)
+    # and the engine reads that row without a trunk.  An engine that refuses the key is remembered: the branch path
+    # from then on, never two prompt reads per request.
+    readout = job.get("readout", False) and not getattr(engine, "readout_refused", False)
+    for ids, context in zip(job["prompts"], job.get("contexts") or [""] * len(job["prompts"])):
         walks = [None if p.tree else _Walk(p.paths) for p in plans]
         probs: list = [None] * len(plans)
+        if readout:
+            p = plans[0]
+            opts = p.nodes[0][1]
+            try:
+                scored, _ = engine.score(ids + p.suffix, [([], opts)], cancel, pin=0, readout=True)
+            except ValueError as e:
+                if not str(e).startswith("readout"):
+                    raise
+                engine.readout_refused = True
+                print(f"[strata] decision readout refused by the engine, branch path from now on: {e}", flush=True)
+                readout = False
+        if readout:
+            r = scored[0]
+            if r is None:
+                raise EngineNonFinite("a decision's scores were not finite")
+            probs[0] = finish_tree(p.paths, p.nodes, [[r[c] for c in opts]])
+            calibration.log_distributions(job["calibration"], plans, probs, context)      # raw, before the map
+            probs = calibration.apply(job["calibration"], plans, probs)
+            results.append(_assemble(plans, probs, walks))
+            continue
         first = True
         while True:
             todo, owner = [], []
@@ -369,6 +408,8 @@ def run(svc, job: dict) -> dict:
             first = False
             if not todo:
                 break
+        calibration.log_distributions(job["calibration"], plans, probs, context)          # raw, before the map
+        probs = calibration.apply(job["calibration"], plans, probs)
         results.append(_assemble(plans, probs, walks))
     return {"results": results}
 
