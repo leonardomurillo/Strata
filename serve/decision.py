@@ -4,7 +4,9 @@ The algorithm is ported from thecodacus/llama.cpp tools/parallel-decision (MIT, 
 finite set of allowed values; each value is a token path, the paths form a trie, and the model's log-probabilities at
 the trie's divergence nodes give each value's probability (`tree`), or one branch per field per round walks the trie
 (`greedy`).  Every field is scored as the first key after `{`, so fields never see each other.  The engine side is
-StrataEngine.score(): the branches follow the prompt's last token and nothing is decoded.
+StrataEngine.score(): the branches follow the prompt's last token and nothing is decoded.  The catalogue lists the
+fields in name order, so the answer does not depend on the order the caller sends them in; the response keeps the
+caller's order.
 
 Enum and boolean options are scored as single-token labels shown next to them in the catalogue (`0`-`9`, from 11
 options `a`-`z`; more are refused): the model is never scored on the option text, and the caller always gets its own
@@ -299,6 +301,8 @@ def prepare(svc, req: dict) -> dict:
     if not all(isinstance(c, str) and c.strip() for c in contexts):
         raise ValueError("every context must be a non-empty string")
     specs = compile_schema(schema)
+    order = [s.name for s in specs]                                 # the caller's order, for the response
+    specs.sort(key=lambda s: s.name)                                # the prompt, plans and key: name order
     allowed = lambda s: ", ".join(f"{k} = {t}" for k, t in zip(s.labels, s.shown)) if s.labels else \
         ", ".join(s.encoded)                                        # noqa: E731
     catalog = "\n".join(_json_text(s.name) + (": " + s.description if s.description else "") +
@@ -331,7 +335,7 @@ def prepare(svc, req: dict) -> dict:
         s0 = len(head) + len(system) + len(mid)
         prompts.append(_ids(svc.tok, text, True, [(len(head), len(head) + len(system)), (s0, s0 + len(c))]))
     return {"plans": plans, "prompts": prompts, "contexts": contexts, "mode": mode, "windows": windows,
-            "readout": len(plans) == 1 and plans[0].one_row,
+            "order": order, "readout": len(plans) == 1 and plans[0].one_row,
             "calibration": calibration.key(specs, instructions)}
 
 
@@ -352,6 +356,12 @@ def run(svc, job: dict) -> dict:
     # and the engine reads that row without a trunk.  An engine that refuses the key is remembered: the branch path
     # from then on, never two prompt reads per request.
     readout = job.get("readout", False) and not getattr(engine, "readout_refused", False)
+    order = job.get("order") or [p.spec.name for p in plans]
+
+    def answer(probs, walks) -> dict:                           # the fields in the caller's order
+        out = _assemble(plans, probs, walks)
+        return {name: out[name] for name in order}
+
     for ids, context in zip(job["prompts"], job.get("contexts") or [""] * len(job["prompts"])):
         walks = [None if p.tree else _Walk(p.paths) for p in plans]
         probs: list = [None] * len(plans)
@@ -373,7 +383,7 @@ def run(svc, job: dict) -> dict:
             probs[0] = finish_tree(p.paths, p.nodes, [[r[c] for c in opts]])
             calibration.log_distributions(job["calibration"], plans, probs, context)      # raw, before the map
             probs = calibration.apply(job["calibration"], plans, probs)
-            results.append(_assemble(plans, probs, walks))
+            results.append(answer(probs, walks))
             continue
         first = True
         while True:
@@ -410,7 +420,7 @@ def run(svc, job: dict) -> dict:
                 break
         calibration.log_distributions(job["calibration"], plans, probs, context)          # raw, before the map
         probs = calibration.apply(job["calibration"], plans, probs)
-        results.append(_assemble(plans, probs, walks))
+        results.append(answer(probs, walks))
     return {"results": results}
 
 

@@ -6,6 +6,7 @@ import json
 import math
 import sys
 import unittest
+from unittest import mock
 import urllib.error
 import urllib.request
 from pathlib import Path
@@ -327,6 +328,47 @@ class Answers(unittest.TestCase):
         self.assertIn("Allowed values: 1, 2, 3, 4, 5, 6, 7, 8, 9", text)          # numeric fields: the numbers
         self.assertIn("respond with the number or letter of the chosen value only", text)
 
+
+class FieldOrder(unittest.TestCase):
+    """The catalogue lists the fields in name order; the response keeps the caller's order."""
+    PERMUTED = dict(reversed(list(SCHEMA.items())))                     # neither SCHEMA nor this is in name order
+    SORTED = dict(sorted(SCHEMA.items()))
+
+    def prepare(self, schema, **kw):
+        svc, _ = rig()
+        return svc, decision.prepare(svc, {"schema": schema, "contexts": ["a", "b"], "instructions": "i", **kw})
+
+    def test_a_permuted_schema_gives_the_same_prompt_and_plans(self):
+        _, a = self.prepare(SCHEMA)
+        _, b = self.prepare(self.PERMUTED)
+        self.assertEqual(a["prompts"], b["prompts"])
+        self.assertEqual([p.spec.name for p in a["plans"]], sorted(SCHEMA))
+        self.assertEqual([p.spec.name for p in b["plans"]], sorted(SCHEMA))
+        self.assertEqual([(p.suffix, p.paths) for p in a["plans"]], [(p.suffix, p.paths) for p in b["plans"]])
+
+    def test_the_response_lists_the_fields_in_the_callers_order(self):
+        for mode in ("tree", "greedy"):
+            for schema in (SCHEMA, self.PERMUTED):
+                svc, job = self.prepare(schema, mode=mode)
+                for r in decision.run(svc, job)["results"]:
+                    self.assertEqual(list(r), list(schema), mode)
+
+    def test_the_calibration_key_does_not_depend_on_the_order(self):
+        _, a = self.prepare(SCHEMA)
+        _, b = self.prepare(self.PERMUTED)
+        self.assertEqual(a["calibration"], b["calibration"])
+        self.assertEqual(a["calibration"], calibration.key(decision.compile_schema(self.SORTED), "i"))
+
+    def test_a_schema_in_name_order_gives_the_prompt_it_gave_before(self):
+        class Unsorted(list):
+            def sort(self, *a, **kw):                                   # the path without the sort
+                pass
+        compile_schema = decision.compile_schema
+        with mock.patch.object(decision, "compile_schema", lambda s: Unsorted(compile_schema(s))):
+            _, old = self.prepare(self.SORTED)
+        _, new = self.prepare(self.PERMUTED)
+        self.assertEqual(new["prompts"], old["prompts"])
+        self.assertEqual(new["calibration"], old["calibration"])
 
 class Labels(unittest.TestCase):
     ENUM = {"c": field("kind", type="enum", choices=["billing", "technical", "other"])}
