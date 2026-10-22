@@ -10083,6 +10083,9 @@ int main(int argc, char** argv) {
             int req_aux_cpus = -1;   // aux_cpus=0|1: --aux-cpus for this request (-1 = the start-up value)
             // score=<branch>;<branch>;... (decisions, serve/decision.py): see the score block after the prompt read
             std::string req_score_text;
+            // readout=1 (decisions, one field): the one branch has no tokens, so its row is the prompt's last
+            // token's; the trunk is neither saved nor restored (the request is one-shot: ckpt=0 is required).
+            bool req_readout = false;
             if (endp != nullptr) {   // GENI takes the same keys (#75: image requests were always greedy); its
                                      // embedding file path is the first token without an =
                 for (;;) {
@@ -10113,6 +10116,7 @@ int main(int argc, char** argv) {
                     else if (key == "spec_min_p") req_spec_min_p = std::clamp((double) fv, 0.0, 1.0);
                     else if (key == "aux_cpus") req_aux_cpus = std::atoi(tok.c_str() + eq + 1) != 0 ? 1 : 0;
                     else if (key == "score") req_score_text = tok.substr(eq + 1);
+                    else if (key == "readout") req_readout = std::atoi(tok.c_str() + eq + 1) != 0;
                     // unknown keys are skipped: the ids start at the first token without '='
                 }
             }
@@ -10175,10 +10179,17 @@ int main(int argc, char** argv) {
                 }
                 if (se.empty() && (geni || n_stages > 1 || o.batch > 0))
                     se = "decisions need a text request on a single-GPU engine without --batch";
+                // a readout reads one row and keeps no trunk: only a one-shot request with exactly one empty branch
+                if (se.empty() && req_readout &&
+                    (req_ckpt || score_branches.size() != 1 || !score_branches[0].toks.empty()))
+                    se = "readout: needs ckpt=0, exactly one branch and no branch tokens";
                 if (!se.empty()) {
                     std::printf("ERR score: %s\n", se.c_str());
                     continue;
                 }
+            } else if (req_readout) {
+                std::printf("ERR score: readout: needs a score= branch\n");
+                continue;
             }
             req_imgs.clear();
             if (geni && !o.vision) { std::printf("ERR this engine was started without --vision\n"); continue; }
@@ -11269,14 +11280,25 @@ int main(int argc, char** argv) {
             if (!cancelled && !score_branches.empty()) {
                 scored = true;
                 finish = "score";
+                // STRATA_SCORE_TIMING=1 (or the readout path): one stderr line per request with the trunk save, the
+                // windows and the restores timed apart - the split that decides whether skipping the trunk pays.
+                static const bool score_timing = [] { const char* v = std::getenv("STRATA_SCORE_TIMING"); return v != nullptr && v[0] == '1'; }();
+                auto sc_ms = [](std::chrono::steady_clock::time_point a) {
+                    return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - a).count();
+                };
+                const auto sc_t0 = std::chrono::steady_clock::now();
+                double sc_ms_win = 0.0, sc_ms_restore = 0.0;
                 ConvCheckpoint trunk;
                 // the tokens the state holds: a restore sets the PLE token pair and the indexer's pooled row from them
-                // (without them every branch after the first ran with no previous tokens)
+                // (without them every branch after the first ran with no previous tokens).  A readout keeps no trunk:
+                // its one branch is the prompt's last token alone, nothing follows it, and ckpt=0 (required) means
+                // the session is neither continued nor parked, so there is nothing to put back.
                 trunk.ids = consumed;
-                if (!ver.wait_commit(err) || !gpu_sync_ok() || !checkpoint_save(trunk, ss, g)) {
+                if (!req_readout && (!ver.wait_commit(err) || !gpu_sync_ok() || !checkpoint_save(trunk, ss, g))) {
                     std::printf("ERR score: saving the trunk failed%s%s\n", ckpt_why.c_str(), err.c_str());
                     return 1;
                 }
+                const double sc_ms_save = sc_ms(sc_t0);
                 struct NoHeadSampling {
                     strata::core::Verifier& v;
                     explicit NoHeadSampling(strata::core::Verifier& x) : v(x) { v.set_head_sampling(false); }
@@ -11308,6 +11330,7 @@ int main(int argc, char** argv) {
                     // untouched (commit writes it) and only a T=1 window commits itself, so its restore may skip it.
                     const bool fast = !score_full && L >= 2 && L <= W;
                     bool row_ok = false;
+                    const auto sc_w0 = std::chrono::steady_clock::now();
                     for (int64_t at = 0;;) {
                         const int T = (int) std::min<int64_t>(W, L - at);
                         drive.d.layers = 0;
@@ -11328,6 +11351,7 @@ int main(int argc, char** argv) {
                         }
                         at += T;
                     }
+                    sc_ms_win += sc_ms(sc_w0);
                     double lse = NAN;
                     if (row_ok) {
                         float mx = -INFINITY;
@@ -11344,9 +11368,15 @@ int main(int argc, char** argv) {
                         std::printf("\n");
                     }
                     // a T=1 window commits itself, and a long branch committed its windows: the trunk comes back
+                    // (a readout only waits for its window's commit: no trunk to come back to, see above)
+                    const auto sc_r0 = std::chrono::steady_clock::now();
                     if (!ver.wait_commit(err) || !gpu_sync_ok()) {
                         std::printf("ERR score: restoring the trunk failed%s%s\n", ckpt_why.c_str(), err.c_str());
                         return 1;
+                    }
+                    if (req_readout) {
+                        sc_ms_restore += sc_ms(sc_r0);
+                        continue;
                     }
                     if (fast && score_check) {
                         gdn_now.resize(trunk.gdn.size());
@@ -11361,8 +11391,14 @@ int main(int argc, char** argv) {
                         std::printf("ERR score: restoring the trunk failed%s%s\n", ckpt_why.c_str(), err.c_str());
                         return 1;
                     }
+                    sc_ms_restore += sc_ms(sc_r0);
                 }
                 std::fflush(stdout);
+                if (score_timing || req_readout)
+                    std::fprintf(stderr, "strata serve: score%s: %zu branch%s, trunk save %.1f ms, windows %.1f ms, "
+                                 "restore %.1f ms, total %.1f ms\n", req_readout ? " (readout, no trunk)" : "",
+                                 score_branches.size(), score_branches.size() == 1 ? "" : "es", sc_ms_save, sc_ms_win,
+                                 sc_ms_restore, sc_ms(sc_t0));
             }
             // ======== --pipeline-windows 2: the decode windows with the two cards overlapped ========
             // Stage 0 (the first card) runs window K+1 while stage 1 verifies window K, on the guess that K is accepted
