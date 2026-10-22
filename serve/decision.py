@@ -36,8 +36,7 @@ MAX_WINDOWS, MAX_BRANCH_TOKENS, DEFAULT_ROWS = 256, 256, 4
 MAX_DIGITS, MAX_LETTERS = 10, 26     # enum/boolean options are scored as labels: 0-9, else a-z (more: refused)
 MARK_L, MARK_R = chr(0xF0EA0), chr(0xF0EA1)                 # private use: not whitespace, so no template trims it
 SYSTEM_MARK, CONTEXT_MARK = MARK_L + "decision-system" + MARK_R, MARK_L + "decision-context" + MARK_R
-SYSTEM_HEAD = ("Select the requested field value from its allowed values, based on the context. "
-               "Where the allowed values are numbered or lettered, respond with the number or letter of the chosen "
+SYSTEM_HEAD = ("Where the allowed values are numbered or lettered, respond with the number or letter of the chosen "
                "value only; otherwise respond with the JSON value only.\n\nFields:\n")
 
 
