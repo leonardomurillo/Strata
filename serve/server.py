@@ -1705,7 +1705,10 @@ class StrataEngine:
             raise ValueError("readout: needs ckpt=0, exactly one branch and no branch tokens")
         spec = ";".join(",".join(str(int(t)) for t in toks) + ":" + ",".join(str(int(c)) for c in cands)
                         for toks, cands in branches)
-        keys = (f" pin={int(pin)}" if pin else " ckpt=0") + (" readout=1" if readout else "") + f" score={spec}"
+        # canon=1: a canonical read (the same request gives the same probabilities whatever the expert cache, the
+        # adaptive tier and the PCIe / prefill shares have done since the start); an engine without the key skips it
+        keys = (f" pin={int(pin)}" if pin else " ckpt=0") + (" readout=1" if readout else "") + " canon=1" + \
+            f" score={spec}"
         try:
             self.proc.stdin.write(f"GEN 1{keys} {','.join(str(int(t)) for t in ids)}\n")
             self.proc.stdin.flush()

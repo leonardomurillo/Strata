@@ -8327,13 +8327,16 @@ int main(int argc, char** argv) {
                 std::fprintf(stderr, "strata serve: STRATA_ADAPT_OVERLAP=1 is off: %s\n", why);
         }
         // a layer split's later stages keep a copy of the residency table on their devices, and swap on their own
-        auto res_upload = [&]() {
+        auto res_upload = [&]() -> cudaError_t {   // the first error (a canonical window must know)
+            cudaError_t e = cudaSuccess;
             if (d_res != nullptr)
-                res_put(d_res);
+                e = res_put(d_res);
             for (auto& st : stages) {
                 const strata::core::OnDevice on(st->dev);
-                res_put(st->d_res);
+                const cudaError_t es = res_put(st->d_res);
+                if (e == cudaSuccess) e = es;
             }
+            return e;
         };
         auto apply_pending = [&](bool wait) {
             if (peer.valid()) peer.apply_pending(wait);
@@ -10086,6 +10089,12 @@ int main(int argc, char** argv) {
             // readout=1 (decisions, one field): the one branch has no tokens, so its row is the prompt's last
             // token's; the trunk is neither saved nor restored (the request is one-shot: ckpt=0 is required).
             bool req_readout = false;
+            // canon=1: a canonical read.  Every routed expert of this request is computed on the GPU - the missed
+            // ones over PCIe where pinned (else the CPU pool, by a fixed rule), none skipped, no prompt chunk shared
+            // with the CPU - and no cached prefix is reused, so its logits depend on the prompt alone, not on what the
+            // expert cache, the adaptive tier, the PCIe share and the prefill share have done since the start.
+            // serve sends it on every decision (score=); other requests keep the adaptive paths.
+            bool req_canon = false;
             if (endp != nullptr) {   // GENI takes the same keys (#75: image requests were always greedy); its
                                      // embedding file path is the first token without an =
                 for (;;) {
@@ -10117,6 +10126,7 @@ int main(int argc, char** argv) {
                     else if (key == "aux_cpus") req_aux_cpus = std::atoi(tok.c_str() + eq + 1) != 0 ? 1 : 0;
                     else if (key == "score") req_score_text = tok.substr(eq + 1);
                     else if (key == "readout") req_readout = std::atoi(tok.c_str() + eq + 1) != 0;
+                    else if (key == "canon") req_canon = std::atoi(tok.c_str() + eq + 1) != 0;
                     // unknown keys are skipped: the ids start at the first token without '='
                 }
             }
@@ -10191,6 +10201,44 @@ int main(int argc, char** argv) {
                 std::printf("ERR score: readout: needs a score= branch\n");
                 continue;
             }
+            // canon=1: the two process-wide switches are paused for this request only, and given back however it ends
+            struct CanonPause {
+                bool on;
+                explicit CanonPause(bool c) : on(c) {
+                    if (on) { strata::core::pause_tail_skip(true); strata::prefill::Prefill::pause_cpu_share(true); }
+                }
+                ~CanonPause() {
+                    if (on) { strata::core::pause_tail_skip(false); strata::prefill::Prefill::pause_cpu_share(false); }
+                }
+            } canon_pause(req_canon);
+            if (req_canon) {
+                req_pcie_frac = 1.0;   // every missed expert of its windows over PCIe to the GPU (the measured share holds)
+                req_ckpt = 0;          // nothing reuses it: the prompt is read in one part, not split at the turn
+            }
+            // canon=1, per window: every routed expert is computed as a miss.  A resident expert goes through the hit
+            // path and a missed one through the PCIe (or CPU) path, which round differently, and which experts are
+            // resident is what the adaptive tier and the prompt path's slot loan change from request to request: with
+            // every expert a miss, each takes the same path every time (over PCIe while the window's staging holds it
+            // and its blob is pinned, else the CPU pool, in routing order), whatever the cache holds.  The tables come
+            // back right after the window, before anything else looks at them.
+            std::vector<int32_t> canon_res;
+            const bool canon_tables = req_canon && !host_res.empty() && d_res != nullptr;
+            auto canon_clear = [&]() -> bool {
+                if (!canon_tables) return true;
+                if (aflipped || !pending.empty()) apply_pending(true);   // the last swaps land: nothing is in flight
+                canon_res = host_res;
+                std::fill(host_res.begin(), host_res.end(), strata::core::kNotResident);
+                if (res_upload() == cudaSuccess) return true;
+                std::printf("ERR canon=1: the residency table could not be cleared for the window\n");
+                return false;
+            };
+            auto canon_restore = [&]() -> bool {
+                if (!canon_tables) return true;
+                std::copy(canon_res.begin(), canon_res.end(), host_res.begin());
+                if (res_upload() == cudaSuccess) return true;
+                std::printf("ERR canon=1: the residency table could not be restored after the window\n");
+                return false;
+            };
             req_imgs.clear();
             if (geni && !o.vision) { std::printf("ERR this engine was started without --vision\n"); continue; }
             if (geni || !mrope_identity) {
@@ -10364,7 +10412,7 @@ int main(int argc, char** argv) {
             }
             int64_t resume = 0;
             bool from_live = false;
-            if (o.prompt_cache > 0 && want_cvec == cvec_cached) {
+            if (o.prompt_cache > 0 && !req_canon && want_cvec == cvec_cached) {
                 if (live_ok && starts_with(live, live_imgs)) { resume = (int64_t) live.size(); from_live = true; }
                 for (const ConvCheckpoint& c : checks)
                     if ((int64_t) c.ids.size() > resume && starts_with(c.ids, c.imgs)) {
@@ -10378,7 +10426,7 @@ int main(int argc, char** argv) {
             int64_t slot_tokens = 0;
             bool resumed_from0 = false;   // a prompt read parked in a slot (BYIELD) that had started at token 0
             const ConvCheckpoint* slot_ck = nullptr;   // the slot's checkpoint the prompt continues from (else its end)
-            if (o.prompt_cache > 0 && req_imgs.empty())
+            if (o.prompt_cache > 0 && !req_canon && req_imgs.empty())
                 for (int b = 0; b < (int) bs.size(); ++b) {
                     const BSlot& sl = bs[(size_t) b];
                     if (sl.active || !sl.cached || sl.cvec != want_cvec) continue;
@@ -10394,7 +10442,8 @@ int main(int argc, char** argv) {
                             slot_ck = &c;
                         }
                 }
-            const auto parked = conversations.best(ids, req_imgs, want_cvec);
+            auto parked = conversations.best(ids, req_imgs, want_cvec);
+            if (req_canon) parked.tokens = 0;   // a canonical read reads its whole prompt (canon=1)
             std::optional<strata::core::SavedConversation> incoming;
             if (parked.tokens > std::max(resume, slot_tokens)) incoming.emplace(conversations.take(parked.index));
             if (incoming) slot_source = -1;
@@ -10636,7 +10685,9 @@ int main(int argc, char** argv) {
             static const bool no_short = std::getenv("STRATA_CKPT_REREAD") != nullptr;
             int64_t req_short_read = o.short_read;   // STRATA_PIPELINE_SWITCH may set it per request (short_read=)
             auto windows_ok = [&](int64_t a, int64_t b) -> bool {
-                if (no_short || b - a > req_short_read) return false;
+                // a canonical read never reads its prompt through the windows: a window of several tokens can miss more
+                // experts than its PCIe staging holds, and which fall to the CPU then depends on the cache (canon=1)
+                if (no_short || req_canon || b - a > req_short_read) return false;
                 if (sp.embd_rows != nullptr)
                     for (int64_t i = a; i < b; ++i)
                         if (sp.embd_rows[i] != nullptr) return false;
@@ -11336,8 +11387,11 @@ int main(int argc, char** argv) {
                         drive.d.layers = 0;
                         drive.d.experts = 0;
                         drive.d.failed = false;
-                        if (!ver.run(T, seq.data() + at, p + at, win_pool_fn, win_pool_user, outw.data(), err) ||
-                            drive.d.failed) {
+                        if (!canon_clear()) return 1;
+                        const bool sw_ok = ver.run(T, seq.data() + at, p + at, win_pool_fn, win_pool_user, outw.data(), err) &&
+                                           !drive.d.failed;
+                        if (!canon_restore()) return 1;
+                        if (!sw_ok) {
                             std::printf("ERR %s\n", drive.d.failed && drive.d.fail ? drive.d.fail : err.c_str());
                             return 1;
                         }
@@ -12145,7 +12199,10 @@ int main(int argc, char** argv) {
                 // STRATA_SPEC_PROB: the MTP drafts' distributions q, judged by rejection sampling (core/spec_prob.hpp);
                 // a suffix window and the lookup chain's tail are point masses and keep the exact-match rule
                 if (use_mtp && mtp.prob() && !from_sfx && T_mtp > 1) ver.set_spec_q(mtp.spec_q(), T_mtp - 1);
-                if (!ver.run(T, window.data(), p, win_pool_fn, win_pool_user, outv.data(), err) || drive.d.failed) {
+                if (!canon_clear()) return 1;
+                const bool win_ok = ver.run(T, window.data(), p, win_pool_fn, win_pool_user, outv.data(), err) && !drive.d.failed;
+                if (!canon_restore()) return 1;
+                if (!win_ok) {
                     std::printf("ERR %s\n", drive.d.failed && drive.d.fail ? drive.d.fail : err.c_str());
                     return 1;
                 }

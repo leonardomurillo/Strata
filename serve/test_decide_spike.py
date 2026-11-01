@@ -29,14 +29,23 @@ class Score(unittest.TestCase):
                         "DS 2 70:-0.500000", "DONE 0 4 1.0 0.0 score 0 0 0")
         out, done = e.score([1, 2, 3, 4], [([10, 11], [65, 66]), ([], [67]), ([12], [70])], threading.Event())
         sent = e.proc.stdin.getvalue()
-        self.assertTrue(sent.startswith("GEN 1 ckpt=0 score=10,11:65,66;:67;12:70 1,2,3,4\n"), sent)
+        self.assertTrue(sent.startswith("GEN 1 ckpt=0 canon=1 score=10,11:65,66;:67;12:70 1,2,3,4\n"), sent)
         self.assertEqual(out, [{65: -0.01, 66: -4.6}, None, {70: -0.5}])
         self.assertIn(" score ", done)
 
     def test_a_pin_keeps_the_request_checkpointed(self):
         e = self.engine("DS 0 65:-0.1", "DONE 0 4 1.0 0.0 score 0 0 0")
         e.score([1, 2, 3, 4], [([10], [65])], threading.Event(), pin=2)
-        self.assertTrue(e.proc.stdin.getvalue().startswith("GEN 1 pin=2 score=10:65 "))
+        self.assertTrue(e.proc.stdin.getvalue().startswith("GEN 1 pin=2 canon=1 score=10:65 "))
+
+    def test_a_readout_is_a_canonical_read_too(self):
+        e = self.engine("DS 0 65:-0.1", "DONE 0 4 1.0 0.0 score 0 0 0")
+        e.score([1, 2, 3, 4], [([], [65, 66])], threading.Event(), readout=True)
+        self.assertTrue(e.proc.stdin.getvalue().startswith("GEN 1 ckpt=0 readout=1 canon=1 score=:65,66 "))
+
+    def test_chat_requests_never_carry_canon(self):
+        for sampling in ({}, {"temperature": 0, "logprobs": True, "top_logprobs": 2}, {"temperature": 0.7, "seed": 3}):
+            self.assertNotIn("canon", StrataEngine.sampling_keys(sampling))
 
     def test_a_refused_decision_is_the_requests_fault_any_other_error_the_engines(self):
         with self.assertRaises(ValueError):
