@@ -185,8 +185,9 @@ public:
     /// `by_default`: this path is one the share was measured on (CUDA, one GPU, no batch slots), so with the variable unset
     /// the share is on for chunks below 1024 tokens (STRATA_PREFILL_CPU_SHARE=0 turns it off).
     static void arm_cpu_share(bool applies, bool by_default = false);
-    /// A canonical read (GEN canon=1): while paused, no chunk hands experts to the CPU pool - every expert on
-    /// the GPU, as with STRATA_PREFILL_CPU_SHARE=0 - and the measured share keeps its state for the requests after it.
+    /// A canonical read (GEN canon=1): while paused, a measured share (auto / the default) hands no experts to the
+    /// CPU pool - every expert on the GPU, as with STRATA_PREFILL_CPU_SHARE=0 - and keeps its state for the requests
+    /// after it. A fixed STRATA_PREFILL_CPU_SHARE value is deterministic and stays on.
     static void pause_cpu_share(bool paused);
 
 private:

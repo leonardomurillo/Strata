@@ -2283,8 +2283,11 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
             bool held = false;
             ~PoolHold() { if (held) g_cpu_pool_busy.store(false, std::memory_order_release); }
         } pool_hold;
+        // a canonical read pauses only the measured share (auto / the default): its per-layer gate and fraction come
+        // from CUDA-event timings, so they differ between processes; a fixed STRATA_PREFILL_CPU_SHARE picks the same
+        // experts for the CPU on every read (fewest tokens first) and stays on
         if (cpu_pool_ != nullptr && cpu_share_on() && !stream_all &&
-            !g_cpu_share_paused.load(std::memory_order_relaxed)) {
+            !(g_cpu_share_paused.load(std::memory_order_relaxed) && cpu_share_env() < 0.0)) {
             bool expect = false;
             pool_hold.held = g_cpu_pool_busy.compare_exchange_strong(expect, true, std::memory_order_acq_rel);
         }
