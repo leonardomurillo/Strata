@@ -196,6 +196,17 @@ inline int64_t cpu_share_max() {
 std::atomic<bool> g_cpu_pool_busy{false};
 // Prefill::pause_cpu_share: a canonical read is running (the share's measured state is left as it is)
 std::atomic<bool> g_cpu_share_paused{false};
+// STRATA_DBG_CANON_CPU=1: a canonical read with a fixed share prints, per prompt read, one hash of every layer's routed
+// counts and one of the experts the CPU took, so two reads of the same prompt can be compared line for line
+inline bool dbg_canon_cpu() {
+    static const bool on = [] { const char* e = std::getenv("STRATA_DBG_CANON_CPU"); return e != nullptr && e[0] == '1'; }();
+    return on;
+}
+inline uint64_t fnv1a(uint64_t h, const void* p, size_t n) {
+    const auto* b = (const uint8_t*) p;
+    for (size_t i = 0; i < n; ++i) { h ^= b[i]; h *= 1099511628211ull; }
+    return h;
+}
 double g_pinned_share = 1.0;
 // The streamed ring: 384 slots when (nearly) every streamed expert is DMA'd from pinned RAM - measured on Q2_0,
 // 8192-token chunks: 96 slots 1153 tok/s, 384 1294 (the next layer's experts arrive during its attention half) -
@@ -790,6 +801,9 @@ struct Prefill::Impl {
     float *cpu_x = nullptr, *cpu_rows = nullptr;
     size_t cpu_x_n = 0, cpu_rows_n = 0;
     bool cpu_dead = false;   // a pinned buffer of the share could not be had (host memory is short): the GPU does it all
+    // STRATA_DBG_CANON_CPU: this prompt read's hashes (reset and printed by Prefill::run)
+    uint64_t dbg_route = 14695981039346656037ull, dbg_pick = 14695981039346656037ull;
+    int64_t dbg_layers = 0, dbg_n_cpu = 0, dbg_res_on_cpu = 0;
     std::vector<uint8_t> cpu_nact;
     std::vector<kernels::cpu::ActQ> cpu_actq;   // a Q2_0 layer's activations (the pool's Q2_0 kernels read ActQ)
     std::vector<kernels::cpu::ExpertJobMulti> cpu_jobs;
@@ -2285,7 +2299,12 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
         } pool_hold;
         // a canonical read pauses only the measured share (auto / the default): its per-layer gate and fraction come
         // from CUDA-event timings, so they differ between processes; a fixed STRATA_PREFILL_CPU_SHARE picks the same
-        // experts for the CPU on every read (fewest tokens first) and stays on
+        // experts for the CPU on every read (fewest tokens first) and stays on.  Which experts those are must not
+        // depend on the VRAM cache either (adaptive swaps change it between two reads of one prompt): canon_cpu
+        // makes the pick read only the routing and the share, and keeps the resident-sorted GPU order off.  There the
+        // share is a fraction of every routed expert, not of the streamed ones.  Still outside it: a share lost to
+        // short host memory (cpu_dead, printed) and, on a layer split, which stage holds the pool
+        const bool canon_cpu = g_cpu_share_paused.load(std::memory_order_relaxed) && cpu_share_env() > 0.0;
         if (cpu_pool_ != nullptr && cpu_share_on() && !stream_all &&
             !(g_cpu_share_paused.load(std::memory_order_relaxed) && cpu_share_env() < 0.0)) {
             bool expect = false;
@@ -3184,12 +3203,15 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                             int64_t nstream = 0;
                             for (int32_t e = 0; e < m.g->n_expert; ++e) {
                                 const int32_t c = m.cnt[(size_t) e];
-                                if (c == 0 || (m.host_res && m.cache && m.host_res[(size_t) l * m.g->n_expert + e] >= 0))
+                                if (c == 0) continue;
+                                // canon_cpu: every routed expert counts, resident or not (residency moves between reads)
+                                if (!canon_cpu && m.host_res && m.cache && m.host_res[(size_t) l * m.g->n_expert + e] >= 0)
                                     continue;
                                 ++nstream;
                                 // a blob the CPU reads from RAM: page-locked, or any other that is not assembled into a
-                                // short-lived buffer (the arena's unpinned part, the mapped experts.bin's pages)
-                                if (c <= strata::kernels::cpu::MAXT && (m.src->pinned(l, e) || !m.src->transient(l, e)))
+                                // short-lived buffer (the arena's unpinned part, the mapped experts.bin's pages);
+                                // canon_cpu: whether it has one is stable_host_blob's (fixed) answer, below
+                                if (c <= strata::kernels::cpu::MAXT && (canon_cpu || m.src->pinned(l, e) || !m.src->transient(l, e)))
                                     cand.emplace_back(c, e);
                             }
                             std::sort(cand.begin(), cand.end());
@@ -3201,8 +3223,15 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                             // here, and an expert without a stable blob stays on the GPU.
                             for (size_t i = 0; i < cand.size() && n_cpu < (int64_t) take; ++i) {
                                 const int32_t e = cand[i].second;
-                                const uint8_t* b = m.src->blob_stable(l, e);
-                                if (b == nullptr) continue;
+                                const uint8_t* b = canon_cpu ? m.src->stable_host_blob(l, e) : m.src->blob_stable(l, e);
+                                if (b == nullptr) {
+                                    static std::atomic<bool> said{false};
+                                    if (canon_cpu && !said.exchange(true))
+                                        std::fprintf(stderr, "prefill: canonical reads give the CPU no experts: this expert "
+                                                             "source has no fixed host copy (a GGUF read in place, or the "
+                                                             "unbuffered file tier); the GPU takes them\n");
+                                    continue;
+                                }
                                 if (on_cpu.empty()) {
                                     on_cpu.assign((size_t) m.g->n_expert, 0);
                                     cpu_blob.assign((size_t) m.g->n_expert, nullptr);
@@ -3212,6 +3241,20 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                 rows_cpu += cand[i].first;
                                 ++n_cpu;
                             }
+                        }
+                        if (canon_cpu && dbg_canon_cpu()) {   // what the pick saw (route) and what it took (pick)
+                            const int64_t at[2] = {p0, l};
+                            m.dbg_route = fnv1a(m.dbg_route, at, sizeof at);
+                            m.dbg_route = fnv1a(m.dbg_route, m.cnt.data(), m.cnt.size() * sizeof(m.cnt[0]));
+                            const int64_t st[4] = {p0, l, (int64_t) pool_hold.held, (int64_t) m.cpu_dead};
+                            m.dbg_pick = fnv1a(m.dbg_pick, st, sizeof st);
+                            for (int32_t e = 0; e < m.g->n_expert && !on_cpu.empty(); ++e)
+                                if (on_cpu[(size_t) e]) {
+                                    m.dbg_pick = fnv1a(m.dbg_pick, &e, sizeof e);
+                                    if (m.host_res && m.cache && m.host_res[(size_t) l * m.g->n_expert + e] >= 0) ++m.dbg_res_on_cpu;
+                                }
+                            ++m.dbg_layers;
+                            m.dbg_n_cpu += n_cpu;
                         }
                         // multi-GPU: the rows of the experts the peer computes go last, as one block [rows_local, T*K)
                         const bool pre_mmq = mmq_plan().any && mmq_plan().layer[(size_t) l];
@@ -3270,7 +3313,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                         // run through MMQ groups takes them in row-count order, so each 16-expert group's max_rows
                         // (its padded tile rows) is close to its experts' own; slot/src/off are rebuilt coherently
                         // before the upload, the routed ids, weights and the within-expert row order stay as they are.
-                        if (detail::mmq_resident_sort_eligible(detail::mmq_resident_sort_requested() && on_peer.empty(), use_mmq, lay.native,
+                        if (detail::mmq_resident_sort_eligible(detail::mmq_resident_sort_requested() && on_peer.empty() && !canon_cpu, use_mmq, lay.native,
                                 m.cache != nullptr, m.host_res ? m.host_res + (size_t) l * m.g->n_expert : nullptr,
                                 m.g->n_expert, stream_all, !stream_all || seq_start[(size_t) l] == seq_start[(size_t) l + 1]))
                             detail::mmq_resident_sort_rows(ids_h, T * K, (int32_t) K, m.cnt, m.off, order, slot_h, src_h);
@@ -4190,7 +4233,15 @@ bool Prefill::drain_pipeline(std::string& err) {
 }
 
 bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& err) {
+    Impl& m = *impl_;
+    m.dbg_route = m.dbg_pick = 14695981039346656037ull;
+    m.dbg_layers = m.dbg_n_cpu = m.dbg_res_on_cpu = 0;
     const bool body_ok = run_impl(tokens, n, pos0, err);
+    if (m.dbg_layers > 0)   // STRATA_DBG_CANON_CPU=1 and a canonical read with a fixed share
+        std::fprintf(stderr, "prefill canon cpu: pos %lld n %lld layers %lld route %016llx pick %016llx cpu %lld "
+                             "resident_on_cpu %lld\n", (long long) pos0, (long long) n, (long long) m.dbg_layers,
+                     (unsigned long long) m.dbg_route, (unsigned long long) m.dbg_pick, (long long) m.dbg_n_cpu,
+                     (long long) m.dbg_res_on_cpu);
 
     std::string drain_err;
     const bool drain_ok = drain_pipeline(drain_err);

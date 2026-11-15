@@ -187,7 +187,11 @@ public:
     static void arm_cpu_share(bool applies, bool by_default = false);
     /// A canonical read (GEN canon=1): while paused, a measured share (auto / the default) hands no experts to the
     /// CPU pool - every expert on the GPU, as with STRATA_PREFILL_CPU_SHARE=0 - and keeps its state for the requests
-    /// after it. A fixed STRATA_PREFILL_CPU_SHARE value is deterministic and stays on.
+    /// after it. A fixed STRATA_PREFILL_CPU_SHARE value stays on, and its pick then reads only the routing: every routed
+    /// expert counts (resident in VRAM or not) and its bytes come from ExpertSource::stable_host_blob, so two reads of
+    /// one prompt hand the CPU the same experts whatever the VRAM cache holds by then. In such a read the share is a
+    /// fraction of every routed expert (more experts than in a chat read), and a source with no fixed host copy (a GGUF
+    /// read in place, the unbuffered file tier) gives the CPU none (said once on stderr).
     static void pause_cpu_share(bool paused);
 
 private:

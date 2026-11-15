@@ -169,6 +169,13 @@ public:
     /// A blob pointer that stays valid (not recycled) for as long as the source is open: for a copy that runs
     /// asynchronously long after the call (the adaptive tier's swap-ins).  Defaults to `blob`.
     virtual const uint8_t* blob_stable(int64_t layer, int64_t expert) { return blob(layer, expert); }
+    /// A host pointer to the blob whose address and nullness do not change while the source is open (no swap, cache
+    /// fill or staging buffer moves it), counting no read; nullptr when this source has no such copy.  The prompt
+    /// path's canonical CPU share reads it so the experts the CPU takes never depend on what the VRAM cache holds.
+    virtual const uint8_t* stable_host_blob(int64_t layer, int64_t expert) const {
+        (void) layer; (void) expert;
+        return nullptr;
+    }
     /// The caller has queued an asynchronous copy out of `blob` (a pointer this source handed out) on `stream` (a
     /// cudaStream_t): the source must not overwrite or recycle that memory until the copy has finished.  A source whose
     /// pointers are never recycled ignores it.  (#1237: a page-locked stage buffer is read by the DMA after the copy call
@@ -685,6 +692,8 @@ public:
     const uint8_t* blob(int64_t layer, int64_t expert) override;
     /// With io prefetch in the experts.bin tier, the mapping itself (blob() may hand out a recycled staging buffer).
     const uint8_t* blob_stable(int64_t layer, int64_t expert) override;
+    /// The mapped experts.bin blob (nullptr for a GGUF read in place or once drop_mapping closed the view).
+    const uint8_t* stable_host_blob(int64_t layer, int64_t expert) const override { return mapped_blob(layer, expert); }
     void note_async_read(const uint8_t* blob, void* stream) override;
     /// Windows, opt-in with STRATA_FILE_RELEASE=1: trim the file mapping's full pages after their expert reaches
     /// VRAM. Never touches the resident complement or staging buffers. Disabled by default.
@@ -928,6 +937,8 @@ public:
     bool mapped() const { return base_ != nullptr; }
     int64_t blobs() const { return blobs_; }
     const uint8_t* blob(int64_t layer, int64_t expert) override;
+    /// The arena's copy, as blob() hands it out, without counting a read.
+    const uint8_t* stable_host_blob(int64_t layer, int64_t expert) const override;
     int64_t reads() const { return reads_; }
     bool pinned(int64_t layer, int64_t expert) const override;
     const uint8_t* device_alias(int64_t layer, int64_t expert) const override;
